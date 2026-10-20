@@ -1,31 +1,42 @@
 /**
  * AI review client.
  *
- * SmartScholar no longer calls AgentRouter directly. Every review is delegated
- * server-side to the isolated review service on Railway (AI_REVIEW_SERVICE_URL),
- * the only component that holds the AgentRouter API key and talks to the
- * gateway. AgentRouter remains the ONLY AI provider:
+ * Two ways to run a review, in priority order:
  *
- *   POST {AI_REVIEW_SERVICE_URL}/review
- *   body: { documentType, text }
- *   200  -> the existing ReviewScore JSON
- *   error-> { error: <code>, message: <client-safe> } with a mapped HTTP status
- *           (400 invalid request, 401/403 config/auth, 413 payload too large,
- *            429 rate limit, 502 malformed upstream, 503 unavailable /
- *            timeout / WAF block)
+ *   1. An external review service, if `AI_REVIEW_SERVICE_URL` is set. The
+ *      contract is unchanged: POST {AI_REVIEW_SERVICE_URL}/review with
+ *      { documentType, text } and get a ReviewScore back. This path exists so
+ *      a future isolated deployment can be dropped in without touching the app.
  *
- * The AgentRouter API key is NOT part of this codebase or of SmartScholar's
- * environment — it lives only in Railway.
+ *   2. In-process provider call (`ai-providers.ts`) — Groq or Gemini, chosen by
+ *      `AI_PROVIDER`. This is the default and needs no hosting: the old Railway
+ *      service is gone and AgentRouter no longer accepts the key.
+ *
+ * Both paths are validated by the same `validateReviewScore`, and neither ever
+ * fabricates a review. Failures surface as the error contract the API route
+ * already understands: AiConfigError, AiCapacityError, or a plain Error mapped
+ * to HTTP 502.
  */
 
-/** Base URL of the isolated AI review service (e.g. https://my-service.up.railway.app). */
+import {
+  runReview,
+  ProviderError,
+  getProvider,
+  getModel,
+} from "@/lib/ai-providers";
+
+/** Optional external review service. Empty means "call the provider directly". */
 export function getReviewServiceUrl(): string {
   return process.env.AI_REVIEW_SERVICE_URL || "";
 }
 
-/** Metadata only — records which model the review service used. Never sent anywhere. */
+/**
+ * Deprecated: the model name used before the review moved in-process.
+ * Prefer the `model` returned by `reviewDocumentWithMeta`, which is the model
+ * that actually produced the review. Kept exported for older callers.
+ */
 export const AGENTROUTER_MODEL =
-  process.env.AGENTROUTER_MODEL || "claude-opus-4-8";
+  process.env.AI_REVIEW_MODEL || process.env.AGENTROUTER_MODEL || getModel(getProvider());
 
 /** AI review service not configured (AI_REVIEW_SERVICE_URL missing / auth issue). */
 export class AiConfigError extends Error {
@@ -236,19 +247,14 @@ function validateReviewScore(data: unknown): ReviewScore {
 }
 
 /**
- * POST {documentType, text} to the review service and return the parsed
- * ReviewScore. Single-provider by design: no fallback chain, no canned reply.
- * Throws AiConfigError / AiCapacityError / AiWafBlockError / Error as mapped
- * above. A successful review is never fabricated.
+ * POST {documentType, text} to an external review service and return the parsed
+ * ReviewScore. Only used when AI_REVIEW_SERVICE_URL is configured.
  */
-async function callReviewService(text: string, documentType: string): Promise<ReviewScore> {
+async function callRemoteService(
+  text: string,
+  documentType: string
+): Promise<{ review: ReviewScore; provider: string; model: string }> {
   const url = getReviewServiceUrl();
-  if (!url) {
-    infoLog("AI review service not configured — AI_REVIEW_SERVICE_URL missing");
-    throw new AiConfigError(
-      "AI review service is not configured: AI_REVIEW_SERVICE_URL is missing from the server environment."
-    );
-  }
 
   debugLog(`[review-service] POST ${url}/review`);
 
@@ -290,37 +296,86 @@ async function callReviewService(text: string, documentType: string): Promise<Re
     throw new Error("AI review service returned a non-JSON response.");
   }
 
-  return validateReviewScore(data);
+  return {
+    review: validateReviewScore(data),
+    provider: "review-service",
+    model: AGENTROUTER_MODEL,
+  };
 }
 
 /**
- * Review a document's extracted text via the Railway AI review service.
+ * Call the configured provider in-process (Groq or Gemini).
+ *
+ * Provider errors are translated into the classes the API route already maps:
+ *   config   -> AiConfigError    (missing key, unknown model)
+ *   capacity -> AiCapacityError  (rate limit / overloaded / quota)
+ *   upstream -> plain Error      (network, timeout, 5xx)
+ *   malformed-> plain Error      (the model answered but not with usable JSON)
+ */
+async function callProviderInProcess(
+  text: string,
+  documentType: string
+): Promise<{ review: ReviewScore; provider: string; model: string }> {
+  try {
+    const result = await runReview(text, documentType);
+    return {
+      review: validateReviewScore(result.review),
+      provider: result.provider,
+      model: result.model,
+    };
+  } catch (e) {
+    if (e instanceof ProviderError) {
+      infoLog(`provider ${e.provider} failed kind=${e.kind}: ${e.message}`);
+      if (e.kind === "config") throw new AiConfigError(e.message);
+      if (e.kind === "capacity") throw new AiCapacityError(e.message);
+      throw new Error(e.message);
+    }
+    throw e;
+  }
+}
+
+/** Route to the external service when configured, otherwise call the provider. */
+async function callReviewService(
+  text: string,
+  documentType: string
+): Promise<{ review: ReviewScore; provider: string; model: string }> {
+  if (getReviewServiceUrl()) {
+    return callRemoteService(text, documentType);
+  }
+  return callProviderInProcess(text, documentType);
+}
+
+/**
+ * Review a document and report which provider/model actually produced it.
  *
  * THROWS on any failure — it never fabricates a successful review. A thrown
  * error is a real failure the caller must surface to the user.
  */
-export async function reviewDocument(
+export async function reviewDocumentWithMeta(
   text: string,
   documentType: string
-): Promise<ReviewScore> {
+): Promise<{ review: ReviewScore; provider: string; model: string }> {
   if (!text || text.trim().length === 0) {
     const err = new Error("The document contains no extractable text to review.");
     infoLog(`rejected empty text for documentType=${documentType}`);
     throw err;
   }
 
+  const target = getReviewServiceUrl() ? "review-service" : getProvider();
   infoLog(
     `review started documentType=${documentType} textChars=${text.length} ` +
-      `model=${AGENTROUTER_MODEL} textFingerprint=${fingerprint(text)}`
+      `target=${target} model=${getModel(getProvider())} ` +
+      `fallback=${process.env.AI_REVIEW_FALLBACK || "none"} ` +
+      `textFingerprint=${fingerprint(text)}`
   );
   debugLog(`[review] text preview (300 chars): ${text.slice(0, 300).replace(/\s+/g, " ")}`);
 
-  let review: ReviewScore;
+  let result: { review: ReviewScore; provider: string; model: string };
   try {
-    review = await callReviewService(text, documentType);
+    result = await callReviewService(text, documentType);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    console.error("[ai-review] review service failed:", msg);
+    console.error("[ai-review] review failed:", msg);
     if (
       e instanceof AiConfigError ||
       e instanceof AiCapacityError ||
@@ -330,6 +385,18 @@ export async function reviewDocument(
     throw new Error(`AI review failed: ${truncateForClient(msg)}`);
   }
 
-  infoLog(`review received responseChars=${JSON.stringify(review).length}`);
+  infoLog(
+    `review received provider=${result.provider} model=${result.model} ` +
+      `responseChars=${JSON.stringify(result.review).length}`
+  );
+  return result;
+}
+
+/** Backwards-compatible wrapper: the review without the provider metadata. */
+export async function reviewDocument(
+  text: string,
+  documentType: string
+): Promise<ReviewScore> {
+  const { review } = await reviewDocumentWithMeta(text, documentType);
   return review;
 }

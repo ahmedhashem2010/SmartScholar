@@ -4,15 +4,18 @@ Inventory of AI-related modules. Facts only.
 
 ## AI Providers
 
-AgentRouter is the **only** AI provider, reached through an isolated review
-service on Railway (`AI_REVIEW_SERVICE_URL`). SmartScholar never calls
-AgentRouter directly and holds no AgentRouter credentials — the API key lives
-only in Railway. There is no fallback chain.
+Reviews run **in-process**: `src/lib/ai-review.ts` validates and maps errors,
+`src/lib/ai-providers.ts` holds the prompt and calls the provider chosen by
+`AI_PROVIDER` (agentrouter | groq | gemini). There is no external review
+service; `AI_REVIEW_SERVICE_URL` is optional and normally empty. Fallback is
+opt-in (`AI_REVIEW_FALLBACK`) and capacity-only.
 
 | Provider | File | Purpose |
 |----------|------|---------|
-| AgentRouter | Railway review service (not in this repo) | The ONLY AI provider for document review, called server-side by the review service |
-| Review service client | `src/lib/ai-review.ts` | SmartScholar's client that POSTs `{ documentType, text }` to the Railway review service |
+| agentrouter | `src/lib/ai-providers.ts` (`callAgentRouter`) | Gateway at agentrouter.org; `x-api-key` + fingerprint headers; default model `deepseek-v4-flash` |
+| groq | `src/lib/ai-providers.ts` (`callGroq`) | OpenAI-compatible JSON mode; default model `openai/gpt-oss-120b` |
+| gemini | `src/lib/ai-providers.ts` (`callGemini`) | Structured output via `responseSchema`; default model `gemini-3-flash-preview` |
+| Review client | `src/lib/ai-review.ts` | Prompt orchestration, ReviewScore validation, error mapping |
 | Embedding provider | `smartscholar-backend/scripts/generateEmbeddings.ts` | Generates scholarship vector embeddings (backend) |
 | Deep-extract AI | `smartscholar-backend/src/deep-extract/ai.ts` | AI extraction for the ingestion pipeline (backend) |
 
@@ -36,16 +39,22 @@ only in Railway. There is no fallback chain.
 
 | File | Prompt purpose |
 |------|----------------|
-| Railway review service (not in this repo) | Prompt that scores a CV/document on quality, ATS, competitiveness; returns JSON — the prompt lives server-side in Railway, not in SmartScholar |
+| `src/lib/ai-providers.ts` (`buildReviewPrompt`) | Scores a CV / personal statement / motivation letter on quality, ATS compatibility and competitiveness; returns the ReviewScore JSON, including a signature verdict |
 | `smartscholar-backend/src/deep-extract/ai.ts` | Extraction prompt for structured scholarship fields |
 
 ## AI Environment Variables
 
 | Variable | Module |
 |----------|--------|
-| `AI_REVIEW_SERVICE_URL` | `src/lib/ai-review.ts` (base URL of the Railway review service; no API key in SmartScholar) |
-| `AI_REVIEW_TIMEOUT_MS` | `src/lib/ai-review.ts` (optional, default 60s) |
-| `AGENTROUTER_MODEL` | `src/lib/ai-review.ts` (metadata only — which model the review service used) |
+| `AI_PROVIDER` | `src/lib/ai-providers.ts` — `agentrouter` \| `groq` \| `gemini` |
+| `AI_REVIEW_MODEL` | `src/lib/ai-providers.ts` — model id for the chosen provider |
+| `AGENTROUTER_API_KEY` / `GROQ_API_KEY` / `GEMINI_API_KEY` | `src/lib/ai-providers.ts` — key for the provider in use |
+| `AI_REVIEW_FALLBACK` | `src/lib/ai-providers.ts` — opt-in capacity-only fallback provider |
+| `AI_MAX_INPUT_CHARS` | `src/lib/ai-providers.ts` — document truncation limit (default 16000) |
+| `AI_REVIEW_LANGUAGE` | `src/lib/ai-providers.ts` — `auto` \| `ar` \| `en` for review prose |
+| `AGENTROUTER_ENDPOINT`, `AGENTROUTER_ORIGINATOR`, `AGENTROUTER_USER_AGENT`, `AGENTROUTER_VERSION` | `src/lib/ai-providers.ts` — gateway base URL and client-fingerprint headers |
+| `AI_REVIEW_SERVICE_URL` | `src/lib/ai-review.ts` — optional external service (normally empty) |
+| `AI_REVIEW_TIMEOUT_MS` | `src/lib/ai-review.ts` (optional, default 40s) |
 | `AI_DEBUG` | `src/lib/ai-review.ts` |
 | `EMBEDDING_API_URL` | `smartscholar-backend/scripts/generateEmbeddings.ts` |
 | `EMBEDDING_API_KEY` | `smartscholar-backend/scripts/generateEmbeddings.ts` |
@@ -56,13 +65,13 @@ only in Railway. There is no fallback chain.
 ```
 User Upload (document)
         ↓
-Review API (/api/documents/[id]/review)
+Review API (/api/documents/[id]/review)  ← auth, quota, text extraction
         ↓
-AI Service (reviewDocument → POST {documentType, text} to AI_REVIEW_SERVICE_URL)
+reviewDocumentWithMeta (src/lib/ai-review.ts)
         ↓
-Railway review service (owns AGENTROUTER_API_KEY, builds the prompt)
+AI Provider (src/lib/ai-providers.ts — agentrouter | groq | gemini)
         ↓
-AI Provider (AgentRouter — the only provider, no fallback)
+AI Provider (no fallback unless AI_REVIEW_FALLBACK is set)
         ↓
 Database (Review record, review quota updated)
         ↓

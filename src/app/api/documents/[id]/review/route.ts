@@ -4,18 +4,25 @@ import { prisma } from "@/lib/prisma";
 import { getAuthenticatedUser } from "@/lib/api-auth";
 import { unauthorized, forbidden } from "@/lib/api-utils";
 import {
-  reviewDocument,
+  reviewDocumentWithMeta,
   calculateAverageScore,
   normalizeSignatureCheck,
   AiConfigError,
   AiCapacityError,
-  AGENTROUTER_MODEL,
 } from "@/lib/ai-review";
 import type { ReviewScore } from "@/lib/ai-review";
 import { extractTextFromFile } from "@/lib/text-extract";
 import { getVersionChain } from "@/lib/document-versions";
 import { DAILY_REVIEW_LIMIT, currentDayKey } from "@/lib/review-quota";
 import { documentFileUrl, findDocumentWithOwnership } from "@/lib/document-access";
+
+/**
+ * A review is one blocking provider call (2–30s typical). Without this, the
+ * platform default can cut the request off mid-review. 60s is the maximum on
+ * Vercel's Hobby plan; the provider timeout (AI_REVIEW_TIMEOUT_MS) is set below
+ * it so the app fails with a message instead of a platform timeout.
+ */
+export const maxDuration = 60;
 
 
 /**
@@ -230,9 +237,14 @@ export async function POST(
 
     debugLog("[POST] Step 9/12: Calling AI review service...");
     let coaching: ReviewScore;
+    let modelUsed: string;
     try {
-      coaching = await reviewDocument(text, document.documentType);
-      debugLog("[POST] AI review complete, overall score:", coaching.overallQuality?.score);
+      const result = await reviewDocumentWithMeta(text, document.documentType);
+      coaching = result.review;
+      // Record what actually ran: provider + model. If a fallback provider
+      // answered, its name is stored, not the configured primary's.
+      modelUsed = `${result.provider}:${result.model}`;
+      debugLog("[POST] AI review complete, overall score:", coaching.overallQuality?.score, "via", modelUsed);
     } catch (aiErr) {
       logError("POST reviewDocument", aiErr);
       // The daily slot was reserved before the call — release it so a failed
@@ -241,8 +253,9 @@ export async function POST(
       const technical = aiErr instanceof Error ? aiErr.message : String(aiErr);
       let message: string;
       if (aiErr instanceof AiConfigError) {
-        message =
-          "AI review failed. The AI review service is not configured — AI_REVIEW_SERVICE_URL is missing from the server environment.";
+        // Operator-facing detail, but it names an env var, not a secret, and a
+        // student seeing "contact support" is more useful than a silent failure.
+        message = `AI review failed. The review provider is not configured: ${technical}`;
       } else if (
         aiErr instanceof AiCapacityError ||
         /quota|rate limit|insufficient|temporarily unavailable|high demand/i.test(technical)
@@ -291,7 +304,7 @@ export async function POST(
           documentId: document.id,
           userId: user.id,
           score: mainScore,
-          modelUsed: AGENTROUTER_MODEL,
+          modelUsed,
           strengths: JSON.stringify(scoresData),
           weaknesses: JSON.stringify([]),
           suggestions: JSON.stringify(coaching.topImprovements ?? []),
@@ -341,7 +354,7 @@ export async function POST(
       quickWins: safeArray(review.grammarIssues),
       overallAssessment: review.overallFeedback,
       signatureCheck,
-      modelUsed: review.modelUsed || AGENTROUTER_MODEL,
+      modelUsed: review.modelUsed || modelUsed,
       createdAt: review.createdAt,
     };
 

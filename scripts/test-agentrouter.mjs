@@ -1,127 +1,137 @@
 import "./_env.mjs";
 
 /**
- * AgentRouter API diagnostic — probes the configured AgentRouter gateway with
- * the Anthropic Messages protocol. The SmartScholar app no longer calls
- * AgentRouter directly: the Railway review service owns the AgentRouter key
- * and is the only caller. Run this script from the Railway service's
- * environment (not SmartScholar's) to debug its upstream.
+ * AgentRouter diagnostic — lists what the account's model group actually
+ * serves, then runs one real chat completion with the configured model.
  *
  *   node scripts/test-agentrouter.mjs
  *
- * Claude models are served over POST /v1/messages with an `x-api-key` header
- * and an `anthropic-version` header — never a Bearer `Authorization` header,
- * which AgentRouter answers with HTTP 401.
+ * Two gateway behaviours this script exists to prove, because both fail with a
+ * bare 401 that looks like "bad key":
+ *   1. Auth is `x-api-key`, not `Authorization: Bearer`.
+ *   2. The gateway fingerprints the client. Originator / User-Agent / Version
+ *      must be present or every request is rejected as
+ *      "unauthorized client detected".
  *
- * Tries a small set of model IDs so you can see which ones your AgentRouter
- * account group actually serves, and reports the live status for each.
+ * Model groups differ per account, and some models only serve
+ * /v1/responses — which is too slow for the app's 60s serverless budget. The
+ * model list below tells you which ones this key can actually run.
  *
  * Reads nothing from the database and writes nothing anywhere.
  */
 
 const KEY = process.env.AGENTROUTER_API_KEY || "";
-const DEFAULT_MODEL = process.env.AGENTROUTER_MODEL || "claude-opus-4-8";
-const URL = process.env.AGENTROUTER_ENDPOINT || "https://agentrouter.org/v1/messages";
+const BASE = (process.env.AGENTROUTER_ENDPOINT || "https://agentrouter.org").replace(/\/+$/, "");
+const MODEL = process.env.AI_REVIEW_MODEL || "deepseek-v4-flash";
 
-// AgentRouter fingerprints its clients and answers unrecognised ones with
-// HTTP 401 "unauthorized client detected" — indistinguishable from a bad key.
-const CLIENT_HEADERS = {
+const HEADERS = {
+  "x-api-key": KEY,
   Originator: process.env.AGENTROUTER_ORIGINATOR || "codex_cli_rs",
   "User-Agent": process.env.AGENTROUTER_USER_AGENT || "codex_cli_rs/0.101.0",
   Version: process.env.AGENTROUTER_VERSION || "0.101.0",
 };
 
-// The configured model first, then common Claude IDs the group might serve.
-const models = [
-  DEFAULT_MODEL,
-  "claude-opus-4-8",
-  "claude-sonnet-4-20250514",
-  "claude-3-5-haiku-20241022",
-].filter((m, i, arr) => arr.indexOf(m) === i);
-
 function ok(m) { console.log(`  \x1b[32m✓\x1b[0m ${m}`); }
 function bad(m) { console.log(`  \x1b[31m✗\x1b[0m ${m}`); }
 function info(m) { console.log(`    ${m}`); }
 
-// Parse by body shape, not content-type — the gateway serves its JSON as
-// text/plain. Handle the Anthropic Messages shape and the OpenAI-compatible
-// one so a changed upstream can't hide behind a 200.
-function responseText(parsed) {
-  return (
-    (parsed?.content?.map((c) => c?.text ?? "").join("") ?? "") ||
-    (parsed?.choices?.[0]?.message?.content ?? "")
-  );
+function clean(s) {
+  return String(s).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
 }
 
-// The 503 body comes back with HTML tags mixed in; strip to a single line.
-function oneLine(s) {
-  return String(s).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
-}
-
-async function testModel(model) {
+async function listModels() {
   try {
-    const response = await fetch(URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": KEY,
-        "anthropic-version": "2023-06-01",
-        ...CLIENT_HEADERS,
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 50,
-        messages: [{ role: "user", content: "Say OK" }],
-      }),
-    });
-
-    const text = await response.text();
-    let parsed;
-    try { parsed = JSON.parse(text); } catch { parsed = text; }
-
-    if (!response.ok) {
-      let hint = "";
-      if (response.status === 401 || response.status === 403) {
-        hint = "key rejected or client not recognised";
-      } else if (response.status === 429) {
-        hint = "rate limited — the key works; wait and re-run";
-      } else if (typeof parsed === "object" && String(text).includes("unauthorized_client")) {
-        hint = "client rejected (not the key)";
-      } else if (typeof parsed === "object" && String(text).includes("\u65e0\u53ef\u7528\u6e20\u9053")) {
-        hint = "no channel for this model in your AgentRouter group";
-      } else {
-        hint = typeof parsed === "object" ? JSON.stringify(parsed).slice(0, 200) : oneLine(text);
+    const res = await fetch(`${BASE}/v1/models`, { headers: HEADERS, signal: AbortSignal.timeout(20000) });
+    const body = await res.text();
+    if (!res.ok) {
+      bad(`GET /v1/models — HTTP ${res.status}`);
+      info(clean(body));
+      if (res.status === 401) {
+        info("401 here usually means the fingerprint headers are wrong, not the key.");
       }
-      return { model, status: response.status, ok: false, hint };
+      return false;
+    }
+    const models = JSON.parse(body).data ?? [];
+    ok(`GET /v1/models — ${models.length} model(s) available to this key`);
+    for (const m of models) {
+      info(`${m.id}  [${(m.supported_endpoint_types ?? []).join(", ")}]`);
+    }
+    if (!models.some((m) => m.id === MODEL)) {
+      info(`\nNote: "${MODEL}" is not in the list above — set AI_REVIEW_MODEL to one that is.`);
+    }
+    return true;
+  } catch (e) {
+    bad(`GET /v1/models — ${e.message}`);
+    return false;
+  }
+}
+
+async function chat() {
+  const started = Date.now();
+  try {
+    const res = await fetch(`${BASE}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...HEADERS },
+      body: JSON.stringify({
+        model: MODEL,
+        temperature: 0.2,
+        max_tokens: 1200,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "user",
+            content: 'Return ONLY this JSON: {"ok": true, "model_works": true}',
+          },
+        ],
+      }),
+      signal: AbortSignal.timeout(60_000),
+    });
+    const body = await res.text();
+    const ms = Date.now() - started;
+
+    if (!res.ok) {
+      bad(`POST /v1/chat/completions — HTTP ${res.status} (${ms}ms)`);
+      info(clean(body));
+      if (res.status === 401) info("Check the fingerprint headers; this is usually not the key.");
+      if (res.status === 400) info("The model may only serve /v1/responses, or your group has no channel for it.");
+      if (res.status === 429) info("Rate limited — the key works; try again shortly.");
+      return false;
     }
 
-    const out = responseText(parsed);
-    if (!out.trim()) return { model, status: response.status, ok: false, hint: "200 OK but empty response" };
-    return { model, status: response.status, ok: true, hint: out.trim().slice(0, 120) };
-  } catch (err) {
-    return { model, status: "ERROR", ok: false, hint: err.message };
+    const p = JSON.parse(body);
+    const content = p.choices?.[0]?.message?.content ?? "";
+    const reasoning = p.choices?.[0]?.message?.reasoning_content ?? "";
+    if (!content) {
+      bad(`HTTP 200 but the completion is empty (${ms}ms, reasoning ${reasoning.length} chars)`);
+      info("A reasoning model spent its whole output budget thinking. Raise max_tokens.");
+      return false;
+    }
+    ok(`POST /v1/chat/completions — working in ${ms}ms`);
+    info(`model=${p.model ?? MODEL} reply=${clean(content)}`);
+    if (reasoning) info(`hidden reasoning: ${reasoning.length} chars (normal for deepseek-v4-flash)`);
+    return true;
+  } catch (e) {
+    bad(`POST /v1/chat/completions — ${e.name}: ${e.message}`);
+    return false;
   }
 }
 
 async function main() {
-  console.log("AgentRouter diagnostic (Anthropic Messages protocol)\n");
+  console.log(`AgentRouter diagnostic (${BASE})\n`);
 
   if (!KEY) {
     bad("AGENTROUTER_API_KEY not set in .env");
-    info("Get a key at https://agentrouter.org and add to .env:");
-    info("  AGENTROUTER_API_KEY=sk-...");
+    info("Get a key at https://agentrouter.org and add it to .env + Vercel.");
     process.exitCode = 1;
     return;
   }
 
-  info(`endpoint: ${URL}`);
-  info(`models to try: ${models.join(", ")}\n`);
+  info(`model: ${MODEL}\n`);
+  const listed = await listModels();
+  console.log();
+  const worked = await chat();
 
-  for (const model of models) {
-    const result = await testModel(model);
-    if (result.ok) ok(`${model} — HTTP ${result.status} — "${result.hint}"`);
-    else bad(`${model} — ${result.status} — ${result.hint}`);
-  }
+  if (!listed || !worked) process.exitCode = 1;
 }
 
 main().catch((err) => {

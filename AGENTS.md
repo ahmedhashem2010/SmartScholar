@@ -43,7 +43,7 @@ auto-populate the Prisma `User` table — that's handled by the profile API rout
 - **Auth:** Supabase Auth (project kkqh...) — cookies managed by `@supabase/ssr`
 - **Database:** PostgreSQL via pooler + Prisma ORM (`prisma/schema.prisma`)
 - **Emails:** Zoho Mail over SMTP via nodemailer (`src/lib/email.ts`) — mailbox `care@smartscholar.org`. Resend is gone.
-- **AI:** AgentRouter is the **only** AI provider — no fallback chain. Single integration in `src/lib/ai-review.ts` (see AI Providers)
+- **AI:** reviews run in-process (`src/lib/ai-providers.ts`), calling one provider directly — AgentRouter, Groq, or Gemini, chosen by `AI_PROVIDER`. No review service, no hosting. Fallback is opt-in and capacity-only (see AI Providers)
 - **Free model:** everything is free. Document reviews run on a daily quota (see `src/lib/review-quota.ts`) — no credits, no billing, no payments.
 - **Matching:** Custom algorithm in `src/lib/scholarship-matcher.ts` (fit score 0-100)
 - **RTL:** Arabic-first (default `lang="ar" dir="rtl"`), IBM Plex Sans + IBM Plex Sans Arabic, language toggle persisted as `smartscholar.lang` in localStorage
@@ -72,8 +72,13 @@ Key vars (all in `.env` at project root):
 - `SUPABASE_SERVICE_ROLE_KEY` — Auth project service role (admin operations)
 - `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` — Zoho SMTP (`smtp.zoho.com:465`, app password, not login password)
 - `EMAIL_FROM` / `EMAIL_REPLY_TO` — must be the authenticated Zoho mailbox
-- `AI_REVIEW_SERVICE_URL` — base URL of the Railway AI review service (required for document reviews). SmartScholar POSTs `{ documentType, text }` to `{AI_REVIEW_SERVICE_URL}/review` and never calls AgentRouter directly; the AgentRouter API key lives only in Railway
-- `AGENTROUTER_MODEL` — metadata only (recorded on the Review record; default `claude-opus-4-8`, live-verified through the gateway; if the Railway group lacks a channel for it the API returns HTTP 503 "无可用渠道")
+- `AI_REVIEW_SERVICE_URL` — **optional / empty**. If set, reviews are POSTed to `{URL}/review` instead of calling a provider directly. The old Railway service is gone; leave this blank.
+- `AI_PROVIDER` — `agentrouter` (default for this deployment), `groq`, or `gemini`. Picks which provider `src/lib/ai-providers.ts` calls.
+- `AGENTROUTER_API_KEY` / `GROQ_API_KEY` / `GEMINI_API_KEY` — key for the provider in use. Set the one you run, plus its fallback, **in Vercel as well as `.env`**.
+- `AI_REVIEW_MODEL` — model id. AgentRouter default `deepseek-v4-flash`; Groq `openai/gpt-oss-120b`; Gemini `gemini-3-flash-preview`.
+- `AI_REVIEW_FALLBACK` — optional single-hop fallback provider, used only on capacity errors. `none` by default.
+- `AI_REVIEW_TIMEOUT_MS` — per-call timeout, default 40000. Must stay under the route's 60s `maxDuration`.
+- `AI_REVIEW_LANGUAGE` — `auto` (match the document) / `ar` / `en` for review prose.
 - `NEXT_PUBLIC_SITE_URL` — canonical public URL, used for email links/OG tags
 - `CRON_SECRET` — shared secret guarding `/api/cron/reminders`
 - `NEXT_PUBLIC_GA_ID` — optional GA4
@@ -112,23 +117,44 @@ Callback route at `src/app/auth/callback/route.ts` — PKCE code exchange (OAuth
 
 ## AI Providers
 
-`src/lib/ai-review.ts` is the single AI client, and it no longer talks to
-AgentRouter directly. Every review is delegated to the isolated review service
-on Railway: SmartScholar POSTs `{ documentType, text }` to
-`{AI_REVIEW_SERVICE_URL}/review` and receives the `ReviewScore` JSON (or
-`{ error, message }` with a mapped status: 400 invalid request, 401/403
-config/auth, 413 too large, 429 rate limit, 502 malformed upstream, 503
-unavailable / timeout / WAF block). The AgentRouter API key and the review
-prompt live **only in Railway** — they are not part of this repo or of
-SmartScholar's environment. AgentRouter remains the **only** AI provider, and
-there is **no provider fallback** — a missing URL, HTTP error or malformed
-response surfaces as a structured `AI_REVIEW_FAILED` error, never a fake
-review. `scripts/test-ai.mjs` verifies the Railway chain (the AgentRouter
-diagnostic `scripts/test-agentrouter.mjs` is for the Railway service's own
-environment). Safe pipeline metrics (text lengths, fingerprints, model, HTTP
-status, response size) are always logged; verbose logging is gated behind
-`AI_DEBUG` — request bodies can contain fragments of student documents, so it
-stays **off in production**.
+Reviews run **in-process** — there is no external review service anymore. The
+old Railway deployment is gone, and the review endpoint now lives in the app:
+
+- `src/lib/ai-providers.ts` — prompt + provider calls (the only code that talks
+  to a model). Providers, chosen by `AI_PROVIDER`:
+  - **agentrouter** — `POST /v1/chat/completions` on agentrouter.org. Auth is
+    `x-api-key` **plus client fingerprint headers** (`Originator`,
+    `User-Agent`, `Version`); Bearer gets 401 "unauthorized client detected".
+    Default model `deepseek-v4-flash` (the account's only chat-capable model).
+    It is a **reasoning** model: hidden reasoning can consume the whole output
+    budget, so the cap is 6000 tokens and an empty answer is classified as
+    capacity (falls back) rather than malformed. Live latency 10–28s.
+  - **groq** — `openai/gpt-oss-120b`, JSON mode, ~3s. Free tier meters
+    8k tokens/minute, so input is truncated to `AI_MAX_INPUT_CHARS` (16k).
+  - **gemini** — `gemini-3-flash-preview` with a response schema, ~8s.
+- `src/lib/ai-review.ts` — contract + validation + error mapping. Keeps
+  `ReviewScore`, `validateReviewScore`, and the `Ai*Error` classes the route
+  already maps. If `AI_REVIEW_SERVICE_URL` is set it POSTs there instead
+  (a future isolated deployment), but the default is a direct provider call.
+- `reviewDocumentWithMeta()` returns the provider/model that actually ran; the
+  route stores `provider:model` in `Review.modelUsed` so a fallback review is
+  never mistaken for the primary's output.
+
+Fallback is **opt-in** (`AI_REVIEW_FALLBACK`) and **capacity-only** — 429,
+overloaded, or an exhausted output budget. It never fires for a bad key or a
+malformed answer, because those are bugs a second provider would hide.
+
+Failures consume no quota: the route releases the reserved daily slot on every
+error path. A missing key, HTTP error or malformed answer surfaces as a
+structured `AI_REVIEW_FAILED`, never a fake review. `scripts/test-ai.mjs`
+verifies the configured path end to end. Safe pipeline metrics (text lengths,
+fingerprints, provider, model, HTTP status, response size) are always logged;
+verbose logging is gated behind `AI_DEBUG` — request bodies can contain
+fragments of student documents, so it stays **off in production**.
+
+Latency note: the review route declares `export const maxDuration = 60` (the
+Vercel Hobby ceiling). Keep `AI_REVIEW_TIMEOUT_MS` below it so a fallback still
+has room to run.
 
 ## Prisma Schema (9 models)
 
