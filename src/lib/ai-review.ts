@@ -24,6 +24,12 @@ import {
   getProvider,
   getModel,
 } from "@/lib/ai-providers";
+import {
+  assumptionNote,
+  type CandidateStage,
+  type CandidateStageInfo,
+  type StageConfidence,
+} from "@/lib/candidate-stage";
 
 /** Optional external review service. Empty means "call the provider directly". */
 export function getReviewServiceUrl(): string {
@@ -123,6 +129,38 @@ export function normalizeSignatureCheck(value: unknown): SignatureCheck | null {
   };
 }
 
+/** The eight rated criteria. Weights live in `SCORE_WEIGHTS` below. */
+export type CriterionKey =
+  | "objectiveFocus"
+  | "evidenceOutcomes"
+  | "relevanceToTarget"
+  | "depthAndContribution"
+  | "leadershipInitiative"
+  | "skillsEvidence"
+  | "writingClarity"
+  | "atsReadability";
+
+export const CRITERION_KEYS: CriterionKey[] = [
+  "objectiveFocus",
+  "evidenceOutcomes",
+  "relevanceToTarget",
+  "depthAndContribution",
+  "leadershipInitiative",
+  "skillsEvidence",
+  "writingClarity",
+  "atsReadability",
+];
+
+export interface ReviewCriterion {
+  rating: number;
+  /** Must quote or closely paraphrase a specific line from the document. */
+  justification: string;
+}
+
+export type ReviewCriteria = Record<CriterionKey, ReviewCriterion>;
+
+export type ImprovementSeverity = "high" | "medium" | "polish";
+
 export interface ReviewScore {
   overallQuality: {
     score: number;
@@ -143,6 +181,71 @@ export interface ReviewScore {
   quickWins: string[];
   overallAssessment: string;
   signatureCheck?: SignatureCheck;
+  /** Present on new reviews; absent on legacy rows produced before stages. */
+  stage?: CandidateStage;
+  stageConfidence?: StageConfidence;
+  /** Shown to the student when the stage had to be assumed. */
+  stageAssumption?: string;
+  /** Aligned by index with `topImprovements`. */
+  improvementSeverities?: ImprovementSeverity[];
+  /** The ratings the model returned, kept for transparency and debugging. */
+  criteria?: ReviewCriteria;
+}
+
+/**
+ * Fixed weights, not model judgement: the same ratings must produce the same
+ * three headline scores on every run. Weights sum to 1.0 per score.
+ */
+export const SCORE_WEIGHTS: Record<
+  "overallQuality" | "atsCompatibility" | "competitiveness",
+  Partial<Record<CriterionKey, number>>
+> = {
+  overallQuality: {
+    objectiveFocus: 0.15,
+    evidenceOutcomes: 0.2,
+    relevanceToTarget: 0.15,
+    depthAndContribution: 0.15,
+    leadershipInitiative: 0.1,
+    skillsEvidence: 0.1,
+    writingClarity: 0.15,
+  },
+  atsCompatibility: {
+    atsReadability: 0.6,
+    relevanceToTarget: 0.2,
+    objectiveFocus: 0.1,
+    skillsEvidence: 0.1,
+  },
+  competitiveness: {
+    evidenceOutcomes: 0.25,
+    depthAndContribution: 0.2,
+    leadershipInitiative: 0.2,
+    relevanceToTarget: 0.2,
+    objectiveFocus: 0.15,
+  },
+};
+
+function clampScore(value: number): number {
+  return Math.min(10, Math.max(1, Math.round(value)));
+}
+
+/** Pure, deterministic: ratings in, the three headline scores out. */
+export function computeScoresFromCriteria(criteria: ReviewCriteria): {
+  overallQuality: number;
+  atsCompatibility: number;
+  competitiveness: number;
+} {
+  const weighted = (weights: Partial<Record<CriterionKey, number>>) =>
+    clampScore(
+      Object.entries(weights).reduce(
+        (sum, [key, weight]) => sum + criteria[key as CriterionKey].rating * (weight ?? 0),
+        0
+      )
+    );
+  return {
+    overallQuality: weighted(SCORE_WEIGHTS.overallQuality),
+    atsCompatibility: weighted(SCORE_WEIGHTS.atsCompatibility),
+    competitiveness: weighted(SCORE_WEIGHTS.competitiveness),
+  };
 }
 
 export function calculateAverageScore(review: ReviewScore): number {
@@ -236,14 +339,134 @@ function mapReviewServiceError(status: number, body: string): Error {
   return new Error(message);
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+function readCriteria(data: unknown): ReviewCriteria | null {
+  const raw = asRecord(asRecord(data)?.criteria);
+  if (!raw) return null;
+
+  const criteria = {} as ReviewCriteria;
+  for (const key of CRITERION_KEYS) {
+    const item = asRecord(raw[key]);
+    if (!item) return null;
+    const rating = item.rating;
+    if (typeof rating !== "number" || !Number.isFinite(rating) || rating < 1 || rating > 10) {
+      return null;
+    }
+    const justification = typeof item.justification === "string" ? item.justification.trim() : "";
+    // A rating without a quote is exactly the generic feedback this rubric
+    // exists to prevent. Treat it as a malformed answer so it is retried rather
+    // than shown to the student.
+    if (!justification) return null;
+    criteria[key] = { rating: clampScore(rating), justification };
+  }
+  return criteria;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim())
+    : [];
+}
+
+function normalizeImprovements(value: unknown): {
+  texts: string[];
+  severities: ImprovementSeverity[];
+} {
+  const items = Array.isArray(value) ? value : [];
+  const texts: string[] = [];
+  const severities: ImprovementSeverity[] = [];
+  for (const item of items.slice(0, 5)) {
+    if (typeof item === "string" && item.trim()) {
+      texts.push(item.trim());
+      severities.push("medium");
+      continue;
+    }
+    const record = asRecord(item);
+    const text = typeof record?.text === "string" ? record.text.trim() : "";
+    if (!text) continue;
+    const severity = record?.severity;
+    texts.push(text);
+    severities.push(
+      severity === "high" || severity === "medium" || severity === "polish" ? severity : "medium"
+    );
+  }
+  return { texts, severities };
+}
+
+function attachStage(review: ReviewScore, stage?: CandidateStageInfo): ReviewScore {
+  if (!stage) return review;
+  return {
+    ...review,
+    stage: stage.stage,
+    stageConfidence: stage.confidence,
+    stageAssumption: assumptionNote(stage) ?? undefined,
+  };
+}
+
+/** New shape: ratings + prose in, fixed-weight scores in code. */
+function buildReviewFromCriteria(
+  data: unknown,
+  criteria: ReviewCriteria,
+  stage?: CandidateStageInfo
+): ReviewScore {
+  const root = asRecord(data) ?? {};
+  const scores = computeScoresFromCriteria(criteria);
+  const ats = asRecord(root.ats);
+  const quality = asRecord(root.overallQuality);
+  const competitive = asRecord(root.competitiveness);
+  const improvements = normalizeImprovements(root.topImprovements);
+
+  const text = (value: unknown): string => (typeof value === "string" ? value : "");
+
+  return attachStage(
+    {
+      overallQuality: {
+        score: scores.overallQuality,
+        strengthsSummary: text(quality?.strengthsSummary),
+        weaknessesSummary: text(quality?.weaknessesSummary),
+      },
+      atsCompatibility: {
+        score: scores.atsCompatibility,
+        missingKeywords: stringArray(ats?.missingKeywords),
+        improvements: stringArray(ats?.improvements),
+      },
+      competitiveness: {
+        score: scores.competitiveness,
+        uniqueStrengths: text(competitive?.uniqueStrengths),
+        differentiation: text(competitive?.differentiation),
+      },
+      topImprovements: improvements.texts,
+      improvementSeverities: improvements.severities,
+      quickWins: stringArray(root.quickWins),
+      overallAssessment: text(root.overallAssessment),
+      signatureCheck: normalizeSignatureCheck(root.signatureCheck) ?? undefined,
+      criteria,
+    },
+    stage
+  );
+}
+
 /**
- * Validate the ReviewScore returned by the review service, with the same
- * strictness as before (object with numeric 1-10 sub-scores).
+ * Validate the review. Two accepted shapes:
+ *
+ *   - criteria (current prompt): eight 1-10 ratings with quotes. The three
+ *     headline scores are computed here, so the same ratings always produce the
+ *     same scores and a rerun cannot drift because the model felt different.
+ *   - legacy scores (external service / older deployments): three 1-10 numbers.
+ *     Still accepted so an older service dropped in via AI_REVIEW_SERVICE_URL
+ *     keeps working.
  */
-function validateReviewScore(data: unknown): ReviewScore {
+function validateReviewScore(data: unknown, stage?: CandidateStageInfo): ReviewScore {
   if (!data || typeof data !== "object") {
     throw new Error("AI review service returned a malformed review.");
   }
+
+  const criteria = readCriteria(data);
+  if (criteria) return buildReviewFromCriteria(data, criteria, stage);
+
   const d = data as {
     overallQuality?: { score?: unknown };
     atsCompatibility?: { score?: unknown };
@@ -255,12 +478,14 @@ function validateReviewScore(data: unknown): ReviewScore {
     d.competitiveness?.score,
   ];
   if (scores.some((s) => typeof s !== "number")) {
+    console.error("[ai-review] malformed review: no criteria and no numeric scores");
     throw new Error("AI review service returned a malformed review.");
   }
   if (scores.some((s) => (s as number) < 1 || (s as number) > 10)) {
+    console.error("[ai-review] malformed review: a score is outside 1-10");
     throw new Error("AI review service returned a malformed review.");
   }
-  return data as ReviewScore;
+  return attachStage(data as ReviewScore, stage);
 }
 
 /**
@@ -269,7 +494,8 @@ function validateReviewScore(data: unknown): ReviewScore {
  */
 async function callRemoteService(
   text: string,
-  documentType: string
+  documentType: string,
+  stage?: CandidateStageInfo
 ): Promise<{ review: ReviewScore; provider: string; model: string }> {
   const url = getReviewServiceUrl();
 
@@ -314,7 +540,7 @@ async function callRemoteService(
   }
 
   return {
-    review: validateReviewScore(data),
+    review: validateReviewScore(data, stage),
     provider: "review-service",
     model: AGENTROUTER_MODEL,
   };
@@ -331,12 +557,13 @@ async function callRemoteService(
  */
 async function callProviderInProcess(
   text: string,
-  documentType: string
+  documentType: string,
+  stage?: CandidateStageInfo
 ): Promise<{ review: ReviewScore; provider: string; model: string }> {
   try {
-    const result = await runReview(text, documentType);
+    const result = await runReview(text, documentType, stage);
     return {
-      review: validateReviewScore(result.review),
+      review: validateReviewScore(result.review, stage),
       provider: result.provider,
       model: result.model,
     };
@@ -354,13 +581,14 @@ async function callProviderInProcess(
 /** Route to the external service when configured, otherwise call the provider. */
 async function callReviewService(
   text: string,
-  documentType: string
+  documentType: string,
+  stage?: CandidateStageInfo
 ): Promise<{ review: ReviewScore; provider: string; model: string }> {
   const url = getReviewServiceUrl();
-  if (!url) return callProviderInProcess(text, documentType);
+  if (!url) return callProviderInProcess(text, documentType, stage);
 
   try {
-    return await callRemoteService(text, documentType);
+    return await callRemoteService(text, documentType, stage);
   } catch (e) {
     if (!(e instanceof RemoteServiceMissingError)) throw e;
 
@@ -378,7 +606,7 @@ async function callReviewService(
       `[ai-review] AI_REVIEW_SERVICE_URL (${host}) returned 404 — that service no longer exists. ` +
         `Falling back to the in-process provider. Remove AI_REVIEW_SERVICE_URL in Vercel to silence this.`
     );
-    return callProviderInProcess(text, documentType);
+    return callProviderInProcess(text, documentType, stage);
   }
 }
 
@@ -390,7 +618,8 @@ async function callReviewService(
  */
 export async function reviewDocumentWithMeta(
   text: string,
-  documentType: string
+  documentType: string,
+  stage?: CandidateStageInfo
 ): Promise<{ review: ReviewScore; provider: string; model: string }> {
   if (!text || text.trim().length === 0) {
     const err = new Error("The document contains no extractable text to review.");
@@ -399,17 +628,21 @@ export async function reviewDocumentWithMeta(
   }
 
   const target = getReviewServiceUrl() ? "review-service" : getProvider();
+  // Stage metadata is safe to log (no date of birth, no age, no document text).
   infoLog(
     `review started documentType=${documentType} textChars=${text.length} ` +
       `target=${target} model=${getModel(getProvider())} ` +
       `fallback=${process.env.AI_REVIEW_FALLBACK || "none"} ` +
+      (stage
+        ? `stage=${stage.stage} stageConfidence=${stage.confidence} stageBasis=${stage.basis} ageBand=${stage.ageBand} `
+        : "stage=none ") +
       `textFingerprint=${fingerprint(text)}`
   );
   debugLog(`[review] text preview (300 chars): ${text.slice(0, 300).replace(/\s+/g, " ")}`);
 
   let result: { review: ReviewScore; provider: string; model: string };
   try {
-    result = await callReviewService(text, documentType);
+    result = await callReviewService(text, documentType, stage);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error("[ai-review] review failed:", msg);
@@ -432,8 +665,9 @@ export async function reviewDocumentWithMeta(
 /** Backwards-compatible wrapper: the review without the provider metadata. */
 export async function reviewDocument(
   text: string,
-  documentType: string
+  documentType: string,
+  stage?: CandidateStageInfo
 ): Promise<ReviewScore> {
-  const { review } = await reviewDocumentWithMeta(text, documentType);
+  const { review } = await reviewDocumentWithMeta(text, documentType, stage);
   return review;
 }

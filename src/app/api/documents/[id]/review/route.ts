@@ -11,6 +11,7 @@ import {
   AiCapacityError,
 } from "@/lib/ai-review";
 import type { ReviewScore } from "@/lib/ai-review";
+import { deriveCandidateStage, type CandidateStageInfo } from "@/lib/candidate-stage";
 import { extractTextFromFile } from "@/lib/text-extract";
 import { getVersionChain } from "@/lib/document-versions";
 import { DAILY_REVIEW_LIMIT, currentDayKey } from "@/lib/review-quota";
@@ -155,6 +156,11 @@ export async function POST(
           topImprovements: safeArray(existingReview.suggestions),
           quickWins: safeArray(existingReview.grammarIssues),
           overallAssessment: existingReview.overallFeedback,
+          stage: scores?.stage,
+          stageConfidence: scores?.stageConfidence,
+          stageAssumption: scores?.stageAssumption,
+          improvementSeverities: scores?.improvementSeverities,
+          criteria: scores?.criteria,
           modelUsed: existingReview.modelUsed,
           createdAt: existingReview.createdAt,
         },
@@ -206,6 +212,33 @@ export async function POST(
       }, { status: 400 });
     }
 
+    // Derive the applicant stage from stored profile data, not from the model.
+    // Only the stage object and a coarse age band reach the prompt or the logs —
+    // the raw date of birth never leaves this block.
+    let stage: CandidateStageInfo;
+    try {
+      const profile = await prisma.userProfile.findUnique({ where: { userId: user.id } });
+      stage = deriveCandidateStage({
+        dateOfBirth: profile?.dateOfBirth ?? null,
+        educationLevel: profile?.educationLevel,
+        targetDegree: profile?.targetDegree,
+        cvText: text,
+      });
+    } catch (profileErr) {
+      // A profile read failure must not fail the review. Derive from the document
+      // alone and let the low/medium confidence note tell the student why.
+      logError("POST load profile for stage", profileErr);
+      stage = deriveCandidateStage({ cvText: text });
+    }
+    debugLog(
+      "[POST] Stage derived:",
+      stage.stage,
+      "confidence:",
+      stage.confidence,
+      "basis:",
+      stage.basis
+    );
+
     // Reserve a daily review slot BEFORE calling the AI, then release it if
     // anything after this point fails. The upsert is atomic on the
     // (userId, day) unique key, so two concurrent requests can't both slip
@@ -239,7 +272,7 @@ export async function POST(
     let coaching: ReviewScore;
     let modelUsed: string;
     try {
-      const result = await reviewDocumentWithMeta(text, document.documentType);
+      const result = await reviewDocumentWithMeta(text, document.documentType, stage);
       coaching = result.review;
       // Record what actually ran: provider + model. If a fallback provider
       // answered, its name is stored, not the configured primary's.
@@ -285,10 +318,17 @@ export async function POST(
     const mainScore = coaching.overallQuality.score;
     const improvementScore = prevScore !== null ? mainScore - prevScore : null;
 
+    // Stage + criteria live inside the existing `strengths` JSON so this needs
+    // no schema migration, and older reviews simply lack the fields.
     const scoresData = {
       overallQuality: coaching.overallQuality,
       atsCompatibility: coaching.atsCompatibility,
       competitiveness: coaching.competitiveness,
+      stage: coaching.stage,
+      stageConfidence: coaching.stageConfidence,
+      stageAssumption: coaching.stageAssumption,
+      improvementSeverities: coaching.improvementSeverities,
+      criteria: coaching.criteria,
     };
 
     const signatureCheck = normalizeSignatureCheck(coaching.signatureCheck);
@@ -354,6 +394,11 @@ export async function POST(
       quickWins: safeArray(review.grammarIssues),
       overallAssessment: review.overallFeedback,
       signatureCheck,
+      stage: coaching.stage,
+      stageConfidence: coaching.stageConfidence,
+      stageAssumption: coaching.stageAssumption,
+      improvementSeverities: coaching.improvementSeverities,
+      criteria: coaching.criteria,
       modelUsed: review.modelUsed || modelUsed,
       createdAt: review.createdAt,
     };
@@ -443,6 +488,11 @@ export async function GET(
         topImprovements: safeArray(review.suggestions),
         quickWins: safeArray(review.grammarIssues),
         overallAssessment: review.overallFeedback,
+        stage: scores?.stage,
+        stageConfidence: scores?.stageConfidence,
+        stageAssumption: scores?.stageAssumption,
+        improvementSeverities: scores?.improvementSeverities,
+        criteria: scores?.criteria,
         signatureCheck: review.signatureStatus
           ? {
               required: review.signatureRequired ?? review.signatureStatus !== "NOT_APPLICABLE",

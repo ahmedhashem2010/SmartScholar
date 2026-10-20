@@ -17,6 +17,14 @@
  * one-way (ai-review -> ai-providers) and avoids an import cycle.
  */
 
+import {
+  assumptionNote,
+  stageLabel,
+  toPromptStage,
+  type CandidateStage,
+  type CandidateStageInfo,
+} from "@/lib/candidate-stage";
+
 export type ProviderName = "groq" | "gemini" | "agentrouter";
 
 /**
@@ -76,7 +84,10 @@ const DEFAULT_MAX_INPUT_CHARS = 16_000;
  * larger one would make the *next* review hit the rate limit.
  */
 const MAX_OUTPUT_TOKENS: Record<ProviderName, number> = {
-  agentrouter: 6_000,
+  // The stage-aware prompt asks for eight rated criteria plus prose, so the
+  // answer is longer than the old three-score response. Reasoning still comes
+  // out of this same budget; 6000 occasionally left nothing for the JSON.
+  agentrouter: 8_000,
   groq: 3_000,
   gemini: 3_000,
 };
@@ -105,13 +116,18 @@ export function getFallbackProvider(): ProviderName | null {
 }
 
 export function getModel(provider: ProviderName): string {
+  // AI_REVIEW_MODEL names the *primary* provider's model. Applying it to a
+  // fallback provider sends an id that provider has never heard of (AgentRouter's
+  // deepseek id to Groq answers 404), so the fallback would fail exactly when it
+  // is needed. Fallbacks use their own default unless AI_REVIEW_MODEL is scoped
+  // to them by the primary being the same provider.
   const override = (process.env.AI_REVIEW_MODEL || "").trim();
-  if (override) return override;
+  if (override && provider === getProvider()) return override;
   // Legacy: the old Railway service used AGENTROUTER_MODEL. It named Claude
   // models that this gateway no longer serves, so only honour it when it looks
   // like a model the current provider can actually run.
   const legacy = (process.env.AGENTROUTER_MODEL || "").trim();
-  if (legacy && !legacy.startsWith("claude-")) return legacy;
+  if (provider === "agentrouter" && legacy && !legacy.startsWith("claude-")) return legacy;
   return DEFAULT_MODELS[provider];
 }
 
@@ -126,10 +142,13 @@ function getApiKey(provider: ProviderName): string {
 }
 
 function timeoutMs(): number {
-  // Must stay below the route's 60s maxDuration so a fallback still has room
-  // to run: 40s + a Groq answer (~3s) + saving the review fits with margin.
-  const raw = Number(process.env.AI_REVIEW_TIMEOUT_MS || 40_000);
-  return Number.isFinite(raw) && raw > 0 ? raw : 40_000;
+  // Must stay below the route's 60s maxDuration. The stage-aware prompt asks
+  // for eight rated criteria plus prose, so answers are longer than the old
+  // three-score response and 40s occasionally timed out on a reasoning model.
+  // 50s leaves room to save the review; a configured fallback would need its
+  // own headroom, which is why production uses AI_REVIEW_FALLBACK=none.
+  const raw = Number(process.env.AI_REVIEW_TIMEOUT_MS || 50_000);
+  return Number.isFinite(raw) && raw > 0 ? raw : 50_000;
 }
 
 function maxInputChars(): number {
@@ -156,7 +175,12 @@ const DOCUMENT_GUIDANCE: Record<string, string> = {
   OTHER: `This is a miscellaneous application document. Judge clarity of purpose, structure, relevance to a scholarship application, and whether the reader can tell what it is for within the first paragraph.`,
 };
 
-export function buildReviewPrompt(text: string, documentType: string, truncated: boolean): string {
+export function buildReviewPrompt(
+  text: string,
+  documentType: string,
+  truncated: boolean,
+  stage?: CandidateStageInfo
+): string {
   const guidance = DOCUMENT_GUIDANCE[documentType] ?? DOCUMENT_GUIDANCE.OTHER;
   const language = (process.env.AI_REVIEW_LANGUAGE || "auto").trim().toLowerCase();
   const languageRule =
@@ -165,6 +189,8 @@ export function buildReviewPrompt(text: string, documentType: string, truncated:
       : language === "en"
         ? "Write every piece of prose in English."
         : "Write every piece of prose in the language the document is mainly written in. If the document mixes languages, use Arabic for the prose and keep quoted phrases in their original language.";
+
+  const stageBlock = stage ? buildStageBlock(stage) : NEUTRAL_STAGE_BLOCK;
 
   return `You are the document reviewer inside SmartScholar, a free service that helps Arab and Middle Eastern students win international scholarships. A student uploaded one document and will act on your feedback. Tell them honestly and specifically how competitive it is and what to change before they submit it.
 
@@ -177,26 +203,57 @@ Rules:
 Document type: ${documentType || "OTHER"}
 ${guidance}
 
-Score three things, each an integer from 1 to 10. Calibration: 1-3 not submittable, 4-5 needs substantial work, 6-7 solid, 8-9 strong and competitive, 10 exceptional.
+${stageBlock}
 
-1. overallQuality — the document as a piece of writing and as evidence of the student's fit. Strengths and weaknesses must each name something concrete from the text.
-2. atsCompatibility — how well this survives automated screening: standard section headings, parseable formatting, and the keywords a scholarship or admissions reader expects for the stated goal. Put the genuinely absent terms in missingKeywords; do not pad the list.
-3. competitiveness — how this document compares with other applicants for a competitive international scholarship. Differentiation must be something only this student could claim.
+How to rate:
+Rate eight criteria, each an integer from 1 to 10, calibrated to the applicant stage above — not to an elite graduate applicant. Every rating needs a justification that quotes or closely paraphrases a specific line from the document. If you cannot point at a line, the rating is not justified.
+
+- objectiveFocus: is the goal (degree, field, programme type) stated and consistently pursued?
+- evidenceOutcomes: claims backed by concrete results, numbers, scope or duration — not duties.
+- relevanceToTarget: how much of the content supports the stated objective and target field.
+- depthAndContribution: how deep the work goes and what the student personally did, versus observation or membership.
+- leadershipInitiative: responsibility, initiative and follow-through appropriate to the stage.
+- skillsEvidence: skills demonstrated through use rather than listed as keywords.
+- writingClarity: structure, concision, grammar, and whether a reader can skim it.
+- atsReadability: standard headings, parseable layout, and terms a scholarship or admissions reader expects for the stated goal.
 
 Then produce:
-- topImprovements: 3 to 5 items, ordered by impact, each one concrete enough to act on today.
-- quickWins: 2 to 4 small fixes that take under ten minutes.
-- overallAssessment: 2 to 4 sentences a student can read and understand without jargon.
-- signatureCheck: whether this kind of document normally requires a signature, and whether this text shows evidence of one. status is SIGNED, NOT_SIGNED, UNCERTAIN or NOT_APPLICABLE. Note that text extraction usually drops images, so a scanned signature often cannot be seen — say so instead of guessing.
+- ats.missingKeywords: genuinely absent terms that matter for the stated objective AND are realistic at this stage. Do not pad, and do not ask a high schooler for graduate-level credentials.
+- ats.improvements: 1 to 3 concrete formatting/parsing fixes.
+- overallQuality.strengthsSummary / weaknessesSummary: each must name something concrete from the text.
+- competitiveness.uniqueStrengths / differentiation: what this student could claim that other applicants for the same goal could not. Differentiation must be specific to this document.
+- topImprovements: at most 5 items, ordered by severity — high, then medium, then polish. Label each "high", "medium" or "polish". If the major gaps are already addressed, label the remaining items "polish" and do not let them dominate. Never list the same fact twice under different labels.
+- quickWins: 2 to 4 fixes that take under ten minutes.
+- overallAssessment: 2 to 4 sentences a student can read without jargon. If the stage was assumed, include the assumption note.
+- signatureCheck: whether this kind of document normally requires a signature, and whether the text shows evidence of one. Note that text extraction usually drops images, so a scanned signature often cannot be seen — say so instead of guessing.
+
+Stage rules you must not break:
+- The stage expectations are part of the rating, not just the prose. Reflect missing stage-level evidence in the relevant criteria instead of only mentioning it in the summary.
+- Judge against the stated stage only. Never penalise a high schooler for lacking publications, preprints, internships, work experience or conference talks.
+- Never suggest missing keywords that are unrealistic at this stage or unrelated to the student's stated objective.
+- Never recommend inventing, inflating or embellishing achievements. If evidence is thin, recommend how to document real work — scope, result, what changed — or which accessible next step to take.
+- Treat every claim as self-reported. Do not penalise the absence of attached certificates or transcripts.
+- Do not move the goalposts: do not raise the bar after the student meets it, and do not let a minor style issue outweigh a real gap.
+- If a criticism could be pasted under any other CV, rewrite it until it could only belong to this one.
 
 ${languageRule}
 
 Return ONLY a JSON object with exactly this shape — no prose, no markdown fences, no trailing commentary:
 {
-  "overallQuality": { "score": <integer 1-10>, "strengthsSummary": <string>, "weaknessesSummary": <string> },
-  "atsCompatibility": { "score": <integer 1-10>, "missingKeywords": [<string>], "improvements": [<string>] },
-  "competitiveness": { "score": <integer 1-10>, "uniqueStrengths": <string>, "differentiation": <string> },
-  "topImprovements": [<string>],
+  "criteria": {
+    "objectiveFocus": { "rating": <integer 1-10>, "justification": <string> },
+    "evidenceOutcomes": { "rating": <integer 1-10>, "justification": <string> },
+    "relevanceToTarget": { "rating": <integer 1-10>, "justification": <string> },
+    "depthAndContribution": { "rating": <integer 1-10>, "justification": <string> },
+    "leadershipInitiative": { "rating": <integer 1-10>, "justification": <string> },
+    "skillsEvidence": { "rating": <integer 1-10>, "justification": <string> },
+    "writingClarity": { "rating": <integer 1-10>, "justification": <string> },
+    "atsReadability": { "rating": <integer 1-10>, "justification": <string> }
+  },
+  "ats": { "missingKeywords": [<string>], "improvements": [<string>] },
+  "overallQuality": { "strengthsSummary": <string>, "weaknessesSummary": <string> },
+  "competitiveness": { "uniqueStrengths": <string>, "differentiation": <string> },
+  "topImprovements": [{ "severity": "<high|medium|polish>", "text": <string> }],
   "quickWins": [<string>],
   "overallAssessment": <string>,
   "signatureCheck": { "required": <boolean>, "status": "<SIGNED|NOT_SIGNED|UNCERTAIN|NOT_APPLICABLE>", "note": <string> }
@@ -206,6 +263,55 @@ ${truncated ? "\nNote: the document was cut off at a length limit. Judge what is
 DOCUMENT:
 ${text}`;
 }
+
+/**
+ * Stage-specific expectations. These are expectations, not quotas: "participation
+ * with a clear role" is enough at Grade 11-12, and winning is never required.
+ * The scale anchors are part of the rubric the product committed to; they are
+ * not a per-fixture answer key.
+ */
+function stageExpectations(stage: CandidateStage): string {
+  switch (stage) {
+    case "high_school_g10":
+      return `Expect strong basics and curiosity. School-level or beginner participation is completely fine: a school club, one small project, an online course, a first competition entry. Do NOT expect awards, research, publications or external recognition. Anything missing is a low-severity "next step", not a failure.`;
+    case "high_school_g11":
+    case "high_school_g12":
+      return `Expect some initiative beyond school coursework: at least one competition, olympiad, summer/enrichment programme, hackathon, certification, research or mentored project, or a real-world project with an outcome. Winning is NOT required — participation with a clear role is enough. If none exists, flag it as a medium-severity gap with concrete, accessible suggestions (name kinds of programmes and competitions), not a harsh penalty. Do not expect internships, publications or work experience.`;
+    case "undergraduate":
+      return `Expect sustained projects or internships, some leadership, and measurable outcomes. Coursework alone is not enough at this stage, but one serious project with a real result outweighs five club memberships.`;
+    case "masters":
+      return `Expect relevant degree-level coursework depth, research or thesis experience, internships or work experience, and publications or technical output where the field expects them. Look for a clear research or career focus that explains why this programme. A CV whose strongest evidence is school projects, school competitions or secondary coursework does NOT meet this bar, even if it is excellent for a high-schooler: without degree-level coursework, research/thesis work, an internship or work experience, evidenceOutcomes and depthAndContribution cannot exceed 5, and competitiveness cannot exceed 6. Say plainly which of those is missing.`;
+    case "phd_or_professional":
+      return `Expect a research track record: publications or equivalent output, advanced specialisation, and evidence strong enough for academic references. Absence of these is a real gap at this stage.`;
+  }
+}
+
+function buildStageBlock(stage: CandidateStageInfo): string {
+  const json = JSON.stringify(toPromptStage(stage), null, 2);
+  const assumed =
+    stage.confidence === "low"
+      ? `\nThe stage was assumed, not known. Include this line verbatim in overallAssessment: "${assumptionNote(stage)}"`
+      : "";
+  return `APPLICANT STAGE — ${stageLabel(stage.stage)} (derived from the student's profile; use it as given and never re-derive or change it from the document).
+${json}
+
+What is expected at this stage:
+${stageExpectations(stage.stage)}
+
+Scale anchors for this stage:
+- A document that meets the expectations above with a focused objective, specific evidence and at least one relevant external activity should score 8-9.
+- A solid, complete but generic document — clear education, some projects or activities, no standout result — should score 5-6. Do not push it into the vague band just because it is not distinctive.
+- A vague, evidence-free document should score 2-4.
+Do not cap a strong high-school document at 7 because it is not graduate-level.${assumed}`;
+}
+
+/**
+ * Used only when a caller has no profile stage (e.g. an internal tool). The
+ * route always passes one; this keeps the function total and the prompt honest
+ * rather than inventing a stage.
+ */
+const NEUTRAL_STAGE_BLOCK = `APPLICANT STAGE: not provided.
+Do not assume a stage. If the document states its objective, judge against that objective and say in overallAssessment that a stage-specific review needs an updated profile. Do not penalise missing graduate-level credentials you cannot confirm are expected.`;
 
 /**
  * Describe a 2xx response whose body is not JSON.
@@ -265,7 +371,8 @@ async function callGroq(prompt: string, model: string): Promise<unknown> {
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
       body: JSON.stringify({
         model,
-        temperature: 0.3,
+        temperature: 0,
+        seed: 7,
         max_completion_tokens: MAX_OUTPUT_TOKENS.groq,
         response_format: { type: "json_object" },
         messages: [{ role: "user", content: prompt }],
@@ -319,37 +426,76 @@ async function callGroq(prompt: string, model: string): Promise<unknown> {
 }
 
 /** Structured-output schema for Gemini (OpenAPI subset). */
+const CRITERION_SCHEMA = {
+  type: "object",
+  properties: {
+    rating: { type: "integer" },
+    justification: { type: "string" },
+  },
+  required: ["rating", "justification"],
+} as const;
+
 const GEMINI_SCHEMA = {
   type: "object",
   properties: {
-    overallQuality: {
+    criteria: {
       type: "object",
       properties: {
-        score: { type: "integer" },
-        strengthsSummary: { type: "string" },
-        weaknessesSummary: { type: "string" },
+        objectiveFocus: CRITERION_SCHEMA,
+        evidenceOutcomes: CRITERION_SCHEMA,
+        relevanceToTarget: CRITERION_SCHEMA,
+        depthAndContribution: CRITERION_SCHEMA,
+        leadershipInitiative: CRITERION_SCHEMA,
+        skillsEvidence: CRITERION_SCHEMA,
+        writingClarity: CRITERION_SCHEMA,
+        atsReadability: CRITERION_SCHEMA,
       },
-      required: ["score", "strengthsSummary", "weaknessesSummary"],
+      required: [
+        "objectiveFocus",
+        "evidenceOutcomes",
+        "relevanceToTarget",
+        "depthAndContribution",
+        "leadershipInitiative",
+        "skillsEvidence",
+        "writingClarity",
+        "atsReadability",
+      ],
     },
-    atsCompatibility: {
+    ats: {
       type: "object",
       properties: {
-        score: { type: "integer" },
         missingKeywords: { type: "array", items: { type: "string" } },
         improvements: { type: "array", items: { type: "string" } },
       },
-      required: ["score", "missingKeywords", "improvements"],
+      required: ["missingKeywords", "improvements"],
+    },
+    overallQuality: {
+      type: "object",
+      properties: {
+        strengthsSummary: { type: "string" },
+        weaknessesSummary: { type: "string" },
+      },
+      required: ["strengthsSummary", "weaknessesSummary"],
     },
     competitiveness: {
       type: "object",
       properties: {
-        score: { type: "integer" },
         uniqueStrengths: { type: "string" },
         differentiation: { type: "string" },
       },
-      required: ["score", "uniqueStrengths", "differentiation"],
+      required: ["uniqueStrengths", "differentiation"],
     },
-    topImprovements: { type: "array", items: { type: "string" } },
+    topImprovements: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          severity: { type: "string", enum: ["high", "medium", "polish"] },
+          text: { type: "string" },
+        },
+        required: ["severity", "text"],
+      },
+    },
     quickWins: { type: "array", items: { type: "string" } },
     overallAssessment: { type: "string" },
     signatureCheck: {
@@ -363,8 +509,9 @@ const GEMINI_SCHEMA = {
     },
   },
   required: [
+    "criteria",
+    "ats",
     "overallQuality",
-    "atsCompatibility",
     "competitiveness",
     "topImprovements",
     "quickWins",
@@ -388,7 +535,7 @@ async function callGemini(prompt: string, model: string): Promise<unknown> {
         body: JSON.stringify({
           contents: [{ role: "user", parts: [{ text: prompt }] }],
           generationConfig: {
-            temperature: 0.3,
+            temperature: 0,
             maxOutputTokens: 4_000,
             responseMimeType: "application/json",
             responseSchema: GEMINI_SCHEMA,
@@ -512,7 +659,11 @@ async function callAgentRouter(prompt: string, model: string): Promise<unknown> 
       headers,
       body: JSON.stringify({
         model,
-        temperature: 0.3,
+        // Greedy decoding: the same CV should produce the same ratings. The
+        // score weights remove drift in the arithmetic; this removes most of it
+        // in the ratings themselves.
+        temperature: 0,
+        seed: 7,
         max_tokens: MAX_OUTPUT_TOKENS.agentrouter,
         response_format: { type: "json_object" },
         messages: [{ role: "user", content: prompt }],
@@ -598,14 +749,23 @@ async function callAgentRouter(prompt: string, model: string): Promise<unknown> 
   }
   const parsed = parseJsonLoose(content);
   if (parsed === null) {
+    // Gated: model prose can quote the student's document. Off in production.
+    if (process.env.AI_DEBUG === "true") {
+      console.error("[ai-providers] AgentRouter non-JSON content preview:", content.slice(0, 500));
+    }
     throw new ProviderError("malformed", "agentrouter", "AgentRouter returned text that is not valid JSON.");
   }
   return parsed;
 }
 
-async function callProvider(provider: ProviderName, text: string, documentType: string): Promise<ReviewProviderResult> {
+async function callProvider(
+  provider: ProviderName,
+  text: string,
+  documentType: string,
+  stage?: CandidateStageInfo
+): Promise<ReviewProviderResult> {
   const { text: body, truncated } = truncateInput(text);
-  const prompt = buildReviewPrompt(body, documentType, truncated);
+  const prompt = buildReviewPrompt(body, documentType, truncated, stage);
   const model = getModel(provider);
 
   const review =
@@ -627,10 +787,14 @@ async function callProvider(provider: ProviderName, text: string, documentType: 
  * disables it. The caller records which provider and model actually produced
  * the review.
  */
-export async function runReview(text: string, documentType: string): Promise<ReviewProviderResult> {
+export async function runReview(
+  text: string,
+  documentType: string,
+  stage?: CandidateStageInfo
+): Promise<ReviewProviderResult> {
   const primary = getProvider();
   try {
-    return await callProvider(primary, text, documentType);
+    return await callProvider(primary, text, documentType, stage);
   } catch (e) {
     const fallback = getFallbackProvider();
     const kind = e instanceof ProviderError ? e.kind : null;
@@ -659,7 +823,7 @@ export async function runReview(text: string, documentType: string): Promise<Rev
     console.warn(
       `[ai-providers] ${primary} failed (${kind}); falling back to ${fallback}`
     );
-    const result = await callProvider(fallback, text, documentType);
+    const result = await callProvider(fallback, text, documentType, stage);
     return { ...result, fallbackFrom: primary };
   }
 }

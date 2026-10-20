@@ -6,8 +6,8 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import {
-  ArrowUpRight, Award, CheckCircle2, ExternalLink, FileText, HelpCircle,
-  Lightbulb, PenLine, Sparkles, TrendingUp, Upload, Zap, AlertCircle,
+  ArrowUpRight, Award, CheckCircle2, ExternalLink, FileText, GraduationCap,
+  HelpCircle, Lightbulb, PenLine, Sparkles, TrendingUp, Upload, Zap, AlertCircle,
 } from "lucide-react";
 import { useLanguage } from "@/contexts/LanguageContext";
 import { ConfettiTrigger } from "@/components/scholarship/confetti-trigger";
@@ -38,6 +38,8 @@ interface SignatureCheckData {
   note: string;
 }
 
+type ImprovementSeverity = "high" | "medium" | "polish";
+
 interface ReviewData extends ScoreBlock {
   id: string;
   score: number;
@@ -45,8 +47,23 @@ interface ReviewData extends ScoreBlock {
   quickWins: string[];
   overallAssessment: string;
   signatureCheck: SignatureCheckData | null;
+  /** Absent on reviews produced before stage-aware reviews existed. */
+  stage?: string;
+  stageConfidence?: "high" | "medium" | "low";
+  stageAssumption?: string;
+  improvementSeverities?: ImprovementSeverity[];
   createdAt: string;
 }
+
+/** Applicant-stage labels for the "reviewing as" chip. */
+const STAGE_LABELS: Record<string, { ar: string; en: string }> = {
+  high_school_g10: { ar: "طالب في الصف العاشر", en: "Grade 10 student" },
+  high_school_g11: { ar: "طالب في الصف الحادي عشر", en: "Grade 11 student" },
+  high_school_g12: { ar: "طالب في الصف الثاني عشر", en: "Grade 12 student" },
+  undergraduate: { ar: "طالب بكالوريوس", en: "Undergraduate" },
+  masters: { ar: "متقدّم للماجستير", en: "Master's applicant" },
+  phd_or_professional: { ar: "متقدّم للدكتوراه أو مهني", en: "PhD / professional applicant" },
+};
 
 interface DocumentData {
   id: string;
@@ -186,6 +203,7 @@ export default function ReviewResultsPage() {
 
   const overall = review.score;
   const delta = prevScore !== null ? Number((overall - prevScore).toFixed(1)) : null;
+  const stageLabel = review.stage ? STAGE_LABELS[review.stage] : undefined;
 
   return (
     <>
@@ -226,7 +244,26 @@ export default function ReviewResultsPage() {
                         : pick("نفس تقييم النسخة السابقة", "Same as your last version")}
                   </p>
                 )}
+
+                {stageLabel && (
+                  <p className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-white/15 px-3 py-1 text-xs font-medium text-white">
+                    <GraduationCap className="h-3.5 w-3.5" />
+                    {pick(`تُراجَع كـ: ${stageLabel.ar}`, `Reviewing as: ${stageLabel.en}`)}
+                  </p>
+                )}
               </div>
+
+              {review.stageConfidence === "low" && stageLabel && (
+                <div className="flex items-start gap-2 border-b border-border bg-[rgb(var(--accent-warm))]/10 px-5 py-3">
+                  <HelpCircle className="mt-0.5 h-4 w-4 shrink-0 text-[rgb(var(--accent-warm))]" />
+                  <p className="text-xs leading-relaxed text-muted-foreground">
+                    {pick(
+                      `افترضنا أن مستواك: ${stageLabel.ar}. حدّث ملفك الشخصي للحصول على مراجعة أدق.`,
+                      `Assumed ${stageLabel.en}; update your profile for a more accurate review.`
+                    )}
+                  </p>
+                </div>
+              )}
 
               <div className="grid gap-px bg-border sm:grid-cols-3">
                 <SubScore
@@ -281,14 +318,36 @@ export default function ReviewResultsPage() {
                 )}
               >
                 <ol className="space-y-3">
-                  {review.topImprovements.map((item, i) => (
-                    <li key={i} className="flex items-start gap-3">
-                      <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/12 text-xs font-bold text-primary">
-                        {num(i + 1)}
-                      </span>
-                      <p className="text-sm leading-relaxed text-muted-foreground">{item}</p>
-                    </li>
-                  ))}
+                  {review.topImprovements.map((item, i) => {
+                    const severity = review.improvementSeverities?.[i];
+                    return (
+                      <li key={i} className="flex items-start gap-3">
+                        <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/12 text-xs font-bold text-primary">
+                          {num(i + 1)}
+                        </span>
+                        <div>
+                          {severity && (
+                            <span
+                              className={`mb-1 inline-block rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                                severity === "high"
+                                  ? "bg-destructive/10 text-destructive"
+                                  : severity === "medium"
+                                    ? "bg-[rgb(var(--accent-warm))]/15 text-[rgb(var(--accent-warm))]"
+                                    : "bg-muted text-muted-foreground"
+                              }`}
+                            >
+                              {severity === "high"
+                                ? pick("أولوية عالية", "High priority")
+                                : severity === "medium"
+                                  ? pick("أولوية متوسطة", "Medium priority")
+                                  : pick("تحسين", "Polish")}
+                            </span>
+                          )}
+                          <p className="text-sm leading-relaxed text-muted-foreground">{item}</p>
+                        </div>
+                      </li>
+                    );
+                  })}
                 </ol>
               </Section>
             )}

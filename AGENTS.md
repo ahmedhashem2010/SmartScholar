@@ -78,7 +78,7 @@ Key vars (all in `.env` at project root):
 - `AI_REVIEW_MODEL` — model id. AgentRouter default `deepseek-v4-flash`; Groq `openai/gpt-oss-120b`; Gemini `gemini-3-flash-preview`.
 - `AGENTROUTER_RELAY_URL` / `AGENTROUTER_RELAY_TOKEN` — **production AgentRouter path**. AgentRouter's WAF blocks Vercel's datacenter IPs with an HTML challenge, so Vercel calls the tiny relay in `railway-agentrouter-relay/` instead. When the URL is set, the relay owns `AGENTROUTER_API_KEY` and the fingerprint headers; leave the key out of Vercel. Empty locally (direct gateway calls work from a residential IP).
 - `AI_REVIEW_FALLBACK` — optional single-hop fallback provider, used only on capacity errors. `none` by default.
-- `AI_REVIEW_TIMEOUT_MS` — per-call timeout, default 40000. Must stay under the route's 60s `maxDuration`.
+- `AI_REVIEW_TIMEOUT_MS` — per-call timeout, default 50000. Must stay under the route's 60s `maxDuration`; the stage-aware answer is longer than the old three-score response.
 - `AI_REVIEW_LANGUAGE` — `auto` (match the document) / `ar` / `en` for review prose.
 - `NEXT_PUBLIC_SITE_URL` — canonical public URL, used for email links/OG tags
 - `CRON_SECRET` — shared secret guarding `/api/cron/reminders`
@@ -153,6 +153,24 @@ old Railway deployment is gone, and the review endpoint now lives in the app:
 - `reviewDocumentWithMeta()` returns the provider/model that actually ran; the
   route stores `provider:model` in `Review.modelUsed` so a fallback review is
   never mistaken for the primary's output.
+- **Stage-aware reviews.** `src/lib/candidate-stage.ts` derives the applicant
+  stage server-side from `dateOfBirth`, `educationLevel`, `targetDegree` and,
+  only as a tiebreaker, the CV's Education section. The prompt receives only
+  `{stage, target_degree, confidence, basis, age_band}` — never the date of
+  birth. A higher target degree wins: a Grade 12 student applying to a Master's
+  is judged as a Master's applicant. Low-confidence derivations default to
+  Grade 12 and carry an assumption note into the review.
+- **Scores are computed in code.** The model returns eight 1–10 criteria with
+  quoted justifications (`criteria` in the review JSON); `computeScoresFromCriteria()`
+  applies fixed weights (`SCORE_WEIGHTS`) to produce content, ATS and
+  competitiveness scores. Temperature is 0, so reruns of the same CV do not
+  drift. Legacy three-score responses are still accepted for the external
+  service path.
+- `AI_REVIEW_MODEL` scopes to the primary provider only. A fallback uses its own
+  default model; sending AgentRouter's `deepseek-v4-flash` id to Groq returns 404.
+- `AI_EVAL=true npx vitest run src/lib/__tests__/ai-stage-eval.test.ts` runs the
+  opt-in live calibration (3 runs each of strong/medium/weak Grade 12 CVs plus a
+  Master's target). It needs a working provider and is skipped by default.
 
 Fallback is **single-hop** and **infrastructure-only** — HTTP 429, an overloaded
 upstream, a timeout, a non-JSON HTTP body (a WAF/HTML interstitial or an empty

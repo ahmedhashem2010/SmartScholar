@@ -2,6 +2,7 @@
 
 import { useState, useRef, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
+import { StageProgress, type ProgressStage } from "@/components/ui/stage-progress";
 import { useLanguage } from "@/contexts/LanguageContext";
 
 const DOCUMENT_TYPES = [
@@ -17,10 +18,23 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/**
+ * Uploads used to show only a disabled button reading "Uploading…", which looks
+ * frozen on a slow connection and then makes the new row pop into the list with
+ * no transition. The overlay names what is happening for the few seconds the
+ * request takes; the list then reveals the new document with its fade-in.
+ */
+const UPLOAD_STAGES: readonly ProgressStage[] = [
+  { at: 0, ar: "رفع ملفك بأمان", en: "Uploading your file securely" },
+  { at: 1_200, ar: "التحقق من الملف وحفظه", en: "Checking and saving the file" },
+  { at: 3_000, ar: "تجهيزه للمراجعة", en: "Getting it ready to review" },
+];
+
 export function UploadDropzone({
   onUploadComplete,
 }: {
-  onUploadComplete: () => void;
+  /** May be async: the overlay stays up until the document list has refreshed. */
+  onUploadComplete: () => void | Promise<void>;
 }) {
   const { pick } = useLanguage();
   const [file, setFile] = useState<File | null>(null);
@@ -78,7 +92,9 @@ export function UploadDropzone({
       } else {
         setFile(null);
         setType("PERSONAL_STATEMENT");
-        onUploadComplete();
+        // Wait for the list refresh before hiding the overlay, so the new row is
+        // already in place when the overlay lifts instead of popping in after.
+        await onUploadComplete();
       }
     } catch {
       setError(pick("فشل الرفع. حاول مرة أخرى.", "Upload failed. Please try again."));
@@ -88,6 +104,20 @@ export function UploadDropzone({
   }
 
   return (
+    <>
+    <StageProgress
+      open={uploading}
+      fileName={file?.name}
+      gradientId="upload-progress-gradient"
+      halfLifeMs={2_500}
+      title={{ ar: "جارٍ رفع مستندك", en: "Uploading your document" }}
+      badge={{ ar: "جارٍ الرفع", en: "Uploading" }}
+      stages={UPLOAD_STAGES}
+      hint={{
+        ar: "عادةً ثوانٍ قليلة. أبقِ هذه الصفحة مفتوحة.",
+        en: "Usually a few seconds. Please keep this page open.",
+      }}
+    />
     <form onSubmit={handleSubmit} className="space-y-4">
       <div>
         <label className="block text-sm font-medium text-foreground mb-1">{pick("نوع المستند", "Document Type")}</label>
@@ -146,5 +176,6 @@ export function UploadDropzone({
         {uploading ? pick("جارٍ الرفع…", "Uploading...") : pick("رفع المستند", "Upload Document")}
       </Button>
     </form>
+    </>
   );
 }

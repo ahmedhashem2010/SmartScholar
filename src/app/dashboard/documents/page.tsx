@@ -191,10 +191,12 @@ export default function DocumentsPage() {
     }
   }
 
-  const handleUploadComplete = () => {
+  const handleUploadComplete = async () => {
     setShowUpload(false);
     addToast("success", pick("تم رفع المستند بنجاح", "Document uploaded successfully"));
-    fetchDocuments();
+    // Await the refresh: the upload overlay remains visible until the new
+    // document is in the list, instead of the row appearing out of nowhere.
+    await fetchDocuments();
   };
 
   if (loading) return <DocumentSkeleton />;
