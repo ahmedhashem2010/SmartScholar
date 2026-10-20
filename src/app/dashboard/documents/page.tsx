@@ -7,6 +7,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { UploadDropzone } from "@/components/documents/upload-dropzone";
 import { ReviewQuota } from "@/components/documents/review-quota";
+import { ReviewProgress } from "@/components/documents/review-progress";
 import { DocumentSkeleton } from "@/components/ui/skeleton";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { ProgressBar } from "@/components/ui/progress-bar";
@@ -367,7 +368,7 @@ export default function DocumentsPage() {
                         size="sm"
                         variant="outline"
                         onClick={() => handleReview(doc.id)}
-                        disabled={reviewingId === doc.id}
+                        disabled={reviewingId !== null}
                         className="gap-1.5"
                       >
                         <Sparkles className="h-3.5 w-3.5" />
@@ -391,6 +392,11 @@ export default function DocumentsPage() {
           })}
         </div>
       )}
+
+      <ReviewProgress
+        open={reviewingId !== null}
+        fileName={documents.find((d) => d.id === reviewingId)?.fileName}
+      />
     </div>
   );
 }
