@@ -1,0 +1,13 @@
+{
+  "name": "agentrouter-relay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Transparent AgentRouter proxy for SmartScholar (Railway). No dependencies.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}

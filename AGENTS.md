@@ -76,6 +76,7 @@ Key vars (all in `.env` at project root):
 - `AI_PROVIDER` — `agentrouter` (default for this deployment), `groq`, or `gemini`. Picks which provider `src/lib/ai-providers.ts` calls.
 - `AGENTROUTER_API_KEY` / `GROQ_API_KEY` / `GEMINI_API_KEY` — key for the provider in use. Set the one you run, plus its fallback, **in Vercel as well as `.env`**.
 - `AI_REVIEW_MODEL` — model id. AgentRouter default `deepseek-v4-flash`; Groq `openai/gpt-oss-120b`; Gemini `gemini-3-flash-preview`.
+- `AGENTROUTER_RELAY_URL` / `AGENTROUTER_RELAY_TOKEN` — **production AgentRouter path**. AgentRouter's WAF blocks Vercel's datacenter IPs with an HTML challenge, so Vercel calls the tiny relay in `railway-agentrouter-relay/` instead. When the URL is set, the relay owns `AGENTROUTER_API_KEY` and the fingerprint headers; leave the key out of Vercel. Empty locally (direct gateway calls work from a residential IP).
 - `AI_REVIEW_FALLBACK` — optional single-hop fallback provider, used only on capacity errors. `none` by default.
 - `AI_REVIEW_TIMEOUT_MS` — per-call timeout, default 40000. Must stay under the route's 60s `maxDuration`.
 - `AI_REVIEW_LANGUAGE` — `auto` (match the document) / `ar` / `en` for review prose.
@@ -129,6 +130,14 @@ old Railway deployment is gone, and the review endpoint now lives in the app:
     It is a **reasoning** model: hidden reasoning can consume the whole output
     budget, so the cap is 6000 tokens and an empty answer is classified as
     capacity (falls back) rather than malformed. Live latency 10–28s.
+    In **production** this provider goes through `railway-agentrouter-relay/`,
+    because AgentRouter's WAF answers Vercel's datacenter IPs with an HTML
+    challenge page (HTTP 200, ~16 KB of `text/html`) before the model runs.
+    The relay is a dependency-free transparent proxy: it adds `x-api-key` and
+    the fingerprint headers and returns the upstream response verbatim, so all
+    prompt/validation logic stays in this repo. Set `AGENTROUTER_RELAY_URL` and
+    `AGENTROUTER_RELAY_TOKEN` in Vercel; leave them empty locally and the app
+    calls the gateway directly.
   - **groq** — `openai/gpt-oss-120b`, JSON mode, ~3s. Free tier meters
     8k tokens/minute, so input is truncated to `AI_MAX_INPUT_CHARS` (16k).
   - **gemini** — `gemini-3-flash-preview` with a response schema, ~8s.

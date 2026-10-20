@@ -88,6 +88,8 @@ const ENV_KEYS = [
   "GROQ_API_KEY",
   "GEMINI_API_KEY",
   "AGENTROUTER_API_KEY",
+  "AGENTROUTER_RELAY_URL",
+  "AGENTROUTER_RELAY_TOKEN",
   "AI_PROVIDER_API_KEY",
   "AI_REVIEW_MODEL",
   "AI_REVIEW_FALLBACK",
@@ -116,6 +118,8 @@ beforeEach(() => {
   delete process.env.GROQ_API_KEY;
   delete process.env.GEMINI_API_KEY;
   delete process.env.AGENTROUTER_API_KEY;
+  delete process.env.AGENTROUTER_RELAY_URL;
+  delete process.env.AGENTROUTER_RELAY_TOKEN;
 });
 
 afterEach(() => {
@@ -666,6 +670,65 @@ describe("reviewDocument — AgentRouter", () => {
     expect(result.provider).toBe("groq");
     expect(result.model).toBe("openai/gpt-oss-120b");
     expect(calls).toHaveLength(2);
+  });
+
+  /* --- relay mode: production reaches the gateway via Railway --------- */
+
+  const RELAY_URL = "https://agentrouter-relay.up.railway.app/v1/chat/completions";
+
+  function useRelay(token = "relay-secret") {
+    delete process.env.AI_REVIEW_SERVICE_URL;
+    process.env.AI_PROVIDER = "agentrouter";
+    delete process.env.AGENTROUTER_API_KEY; // the relay owns the key
+    process.env.AGENTROUTER_RELAY_URL = "https://agentrouter-relay.up.railway.app";
+    process.env.AGENTROUTER_RELAY_TOKEN = token;
+  }
+
+  it("posts to the relay with the token and no gateway key", async () => {
+    useRelay();
+    const calls = mockFetch([
+      {
+        url: RELAY_URL,
+        body: JSON.stringify({ choices: [{ message: { content: JSON.stringify(validReview) } }] }),
+      },
+    ]);
+
+    await expect(reviewDocument("Some CV text", "CV")).resolves.toEqual(validReview);
+
+    expect(calls[0]!.url).toBe(RELAY_URL);
+    const headers = calls[0]!.init.headers as Record<string, string>;
+    expect(headers["x-relay-token"]).toBe("relay-secret");
+    expect(headers["x-api-key"]).toBeUndefined();
+    expect(headers.Authorization).toBeUndefined();
+  });
+
+  it("explains a relay token mismatch instead of blaming the gateway", async () => {
+    useRelay("wrong-token");
+    mockFetch([
+      {
+        url: RELAY_URL,
+        status: 401,
+        body: JSON.stringify({ error: { message: "Invalid or missing x-relay-token." } }),
+      },
+    ]);
+
+    const err = await reviewDocument("Some CV text", "CV").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AiConfigError);
+    expect((err as Error).message).toMatch(/AGENTROUTER_RELAY_TOKEN/);
+    expect((err as Error).message).not.toContain("wrong-token");
+  });
+
+  it("does not require a direct key when the relay is configured", async () => {
+    useRelay();
+    const calls = mockFetch([
+      {
+        url: RELAY_URL,
+        body: JSON.stringify({ choices: [{ message: { content: JSON.stringify(validReview) } }] }),
+      },
+    ]);
+
+    await reviewDocument("Some CV text", "CV");
+    expect(calls).toHaveLength(1);
   });
 });
 

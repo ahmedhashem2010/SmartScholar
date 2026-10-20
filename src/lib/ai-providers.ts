@@ -469,18 +469,41 @@ function agentRouterHeaders(): Record<string, string> {
   };
 }
 
+/**
+ * Optional relay base URL (`railway-agentrouter-relay`).
+ *
+ * AgentRouter's WAF answers Vercel's datacenter IPs with an HTML challenge page,
+ * so production reaches it through a tiny relay whose egress it accepts. When
+ * this is set, the relay owns the key and the fingerprint headers and the app
+ * sends neither. Left unset, the app talks to the gateway directly, which is
+ * what local development needs.
+ */
+function agentRouterRelayUrl(): string {
+  return (process.env.AGENTROUTER_RELAY_URL || "").trim().replace(/\/+$/, "");
+}
+
 async function callAgentRouter(prompt: string, model: string): Promise<unknown> {
-  if (!getApiKey("agentrouter")) {
+  const relay = agentRouterRelayUrl();
+
+  if (!relay && !getApiKey("agentrouter")) {
     throw new ProviderError("config", "agentrouter", "AGENTROUTER_API_KEY is missing from the server environment.");
   }
 
-  const base = (process.env.AGENTROUTER_ENDPOINT || "https://agentrouter.org").replace(/\/+$/, "");
+  const base = relay || (process.env.AGENTROUTER_ENDPOINT || "https://agentrouter.org").replace(/\/+$/, "");
+
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (relay) {
+    const token = (process.env.AGENTROUTER_RELAY_TOKEN || "").trim();
+    if (token) headers["x-relay-token"] = token;
+  } else {
+    Object.assign(headers, agentRouterHeaders());
+  }
 
   let res: Response;
   try {
     res = await fetch(`${base}/v1/chat/completions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", ...agentRouterHeaders() },
+      headers,
       body: JSON.stringify({
         model,
         temperature: 0.3,
@@ -492,10 +515,11 @@ async function callAgentRouter(prompt: string, model: string): Promise<unknown> 
     });
   } catch (e) {
     const name = e instanceof Error ? e.name : "";
+    const where = relay ? "The AgentRouter relay" : "AgentRouter";
     if (name === "TimeoutError" || name === "AbortError") {
-      throw new ProviderError("upstream", "agentrouter", `AgentRouter timed out after ${timeoutMs()}ms.`);
+      throw new ProviderError("upstream", "agentrouter", `${where} timed out after ${timeoutMs()}ms.`);
     }
-    throw new ProviderError("upstream", "agentrouter", `AgentRouter is unreachable: ${e instanceof Error ? e.message : String(e)}`);
+    throw new ProviderError("upstream", "agentrouter", `${where} is unreachable: ${e instanceof Error ? e.message : String(e)}`);
   }
 
   const body = await res.text().catch(() => "");
@@ -508,6 +532,14 @@ async function callAgentRouter(prompt: string, model: string): Promise<unknown> 
       /* keep raw */
     }
     if (res.status === 401 || res.status === 403) {
+      if (relay) {
+        throw new ProviderError(
+          "config",
+          "agentrouter",
+          `The AgentRouter relay rejected the request (HTTP ${res.status}): ${message} ` +
+            `Check that AGENTROUTER_RELAY_TOKEN matches RELAY_TOKEN on the relay.`
+        );
+      }
       const fingerprintIssue = /unauthorized client/i.test(message);
       throw new ProviderError(
         "config",

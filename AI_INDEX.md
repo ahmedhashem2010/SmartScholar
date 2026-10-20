@@ -13,6 +13,7 @@ opt-in (`AI_REVIEW_FALLBACK`) and capacity-only.
 | Provider | File | Purpose |
 |----------|------|---------|
 | agentrouter | `src/lib/ai-providers.ts` (`callAgentRouter`) | Gateway at agentrouter.org; `x-api-key` + fingerprint headers; default model `deepseek-v4-flash` |
+| AgentRouter relay (prod) | `railway-agentrouter-relay/server.mjs` | Dependency-free transparent proxy on Railway; Vercel's IPs are WAF-blocked, so the relay adds the key + fingerprint headers. Used when `AGENTROUTER_RELAY_URL` is set |
 | groq | `src/lib/ai-providers.ts` (`callGroq`) | OpenAI-compatible JSON mode; default model `openai/gpt-oss-120b` |
 | gemini | `src/lib/ai-providers.ts` (`callGemini`) | Structured output via `responseSchema`; default model `gemini-3-flash-preview` |
 | Review client | `src/lib/ai-review.ts` | Prompt orchestration, ReviewScore validation, error mapping |
@@ -53,6 +54,8 @@ opt-in (`AI_REVIEW_FALLBACK`) and capacity-only.
 | `AI_MAX_INPUT_CHARS` | `src/lib/ai-providers.ts` — document truncation limit (default 16000) |
 | `AI_REVIEW_LANGUAGE` | `src/lib/ai-providers.ts` — `auto` \| `ar` \| `en` for review prose |
 | `AGENTROUTER_ENDPOINT`, `AGENTROUTER_ORIGINATOR`, `AGENTROUTER_USER_AGENT`, `AGENTROUTER_VERSION` | `src/lib/ai-providers.ts` — gateway base URL and client-fingerprint headers |
+| `AGENTROUTER_RELAY_URL`, `AGENTROUTER_RELAY_TOKEN` | `src/lib/ai-providers.ts` — production path via `railway-agentrouter-relay/` (relay owns the gateway key) |
+| `RELAY_TOKEN` | `railway-agentrouter-relay/server.mjs` — shared secret the app must send |
 | `AI_REVIEW_SERVICE_URL` | `src/lib/ai-review.ts` — optional external service (normally empty) |
 | `AI_REVIEW_TIMEOUT_MS` | `src/lib/ai-review.ts` (optional, default 40s) |
 | `AI_DEBUG` | `src/lib/ai-review.ts` |
