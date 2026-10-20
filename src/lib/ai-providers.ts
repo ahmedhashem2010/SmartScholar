@@ -91,7 +91,13 @@ export function getProvider(): ProviderName {
 /** Provider to fall back to when the primary is out of capacity. "" = none. */
 export function getFallbackProvider(): ProviderName | null {
   const raw = (process.env.AI_REVIEW_FALLBACK || "").trim().toLowerCase();
-  if (!raw || raw === "none" || raw === "off") return null;
+  if (raw === "none" || raw === "off") return null;
+  if (!raw) {
+    // Unset means "use the obvious safety net": if a Groq key is present, an
+    // AgentRouter outage should cost review *quality*, not the whole review.
+    // Set AI_REVIEW_FALLBACK=none to require a single provider.
+    return getApiKey("groq") ? "groq" : null;
+  }
   if (raw === "gemini") return "gemini";
   if (raw === "groq") return "groq";
   if (raw === "agentrouter") return "agentrouter";
@@ -120,8 +126,10 @@ function getApiKey(provider: ProviderName): string {
 }
 
 function timeoutMs(): number {
-  const raw = Number(process.env.AI_REVIEW_TIMEOUT_MS || 55_000);
-  return Number.isFinite(raw) && raw > 0 ? raw : 55_000;
+  // Must stay below the route's 60s maxDuration so a fallback still has room
+  // to run: 40s + a Groq answer (~3s) + saving the review fits with margin.
+  const raw = Number(process.env.AI_REVIEW_TIMEOUT_MS || 40_000);
+  return Number.isFinite(raw) && raw > 0 ? raw : 40_000;
 }
 
 function maxInputChars(): number {
@@ -199,6 +207,26 @@ DOCUMENT:
 ${text}`;
 }
 
+/**
+ * Describe a 2xx response whose body is not JSON.
+ *
+ * A model that answers with prose is a malformed *answer*. An HTML page or an
+ * empty body is the gateway (or a WAF/proxy in front of it) failing before the
+ * model ever runs. Only the second case is worth retrying elsewhere, so this
+ * helper also logs a short, sanitized preview — the preview is usually the only
+ * way to tell a Cloudflare interstitial from a truncated response, and it never
+ * contains a key.
+ */
+function describeNonJson(provider: string, res: Response, body: string): string {
+  const contentType = res.headers.get("content-type") || "no content-type";
+  const preview = body.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+  console.error(
+    `[ai-providers] ${provider} non-JSON body: status=${res.status} contentType=${contentType} ` +
+      `bytes=${body.length} preview=${JSON.stringify(preview)}`
+  );
+  return `${provider} returned a non-JSON response (HTTP ${res.status}, ${contentType}, ${body.length} bytes).`;
+}
+
 /** Strip ```json fences and any leading prose a model may add defensively. */
 function parseJsonLoose(raw: string): unknown {
   const text = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
@@ -266,7 +294,7 @@ async function callGroq(prompt: string, model: string): Promise<unknown> {
   try {
     payload = JSON.parse(body);
   } catch {
-    throw new ProviderError("malformed", "groq", "Groq returned a non-JSON response body.");
+    throw new ProviderError("upstream", "groq", describeNonJson("Groq", res, body));
   }
 
   const choice = payload.choices?.[0];
@@ -401,7 +429,7 @@ async function callGemini(prompt: string, model: string): Promise<unknown> {
   try {
     payload = JSON.parse(body);
   } catch {
-    throw new ProviderError("malformed", "gemini", "Gemini returned a non-JSON response body.");
+    throw new ProviderError("upstream", "gemini", describeNonJson("Gemini", res, body));
   }
 
   const candidate = payload.candidates?.[0];
@@ -509,7 +537,7 @@ async function callAgentRouter(prompt: string, model: string): Promise<unknown> 
   try {
     payload = JSON.parse(body);
   } catch {
-    throw new ProviderError("malformed", "agentrouter", "AgentRouter returned a non-JSON response body.");
+    throw new ProviderError("upstream", "agentrouter", describeNonJson("AgentRouter", res, body));
   }
 
   const choice = payload.choices?.[0];
@@ -554,10 +582,12 @@ async function callProvider(provider: ProviderName, text: string, documentType: 
 /**
  * Run the review on the configured provider.
  *
- * Fallback is opt-in (`AI_REVIEW_FALLBACK`), single-hop, and only for capacity
- * or upstream failures — never for a bad key or a malformed answer, because
- * those are bugs that a second provider would silently paper over. The caller
- * records which provider and model actually produced the review.
+ * Fallback is single-hop and infrastructure-only (capacity or upstream) —
+ * never for a bad key or for a model whose own answer is malformed, because
+ * those are bugs that a second provider would silently paper over. It defaults
+ * to Groq when `AI_REVIEW_FALLBACK` is unset and a Groq key exists; `none`
+ * disables it. The caller records which provider and model actually produced
+ * the review.
  */
 export async function runReview(text: string, documentType: string): Promise<ReviewProviderResult> {
   const primary = getProvider();
@@ -566,13 +596,27 @@ export async function runReview(text: string, documentType: string): Promise<Rev
   } catch (e) {
     const fallback = getFallbackProvider();
     const kind = e instanceof ProviderError ? e.kind : null;
+    const eligible = kind === "capacity" || kind === "upstream";
     const canFallBack =
       fallback !== null &&
       fallback !== primary &&
-      (kind === "capacity" || kind === "upstream") &&
+      eligible &&
       Boolean(getApiKey(fallback));
 
-    if (!canFallBack) throw e;
+    if (!canFallBack) {
+      // A fallback that is configured but has no key is a deployment mistake.
+      // Say so, instead of showing the primary's gateway error and leaving the
+      // operator to guess why the safety net did not catch them.
+      if (fallback !== null && fallback !== primary && eligible && !getApiKey(fallback)) {
+        throw new ProviderError(
+          "config",
+          primary,
+          `${e instanceof Error ? e.message : String(e)} ` +
+            `(${fallback} is configured as the fallback provider but its API key is missing from the server environment.)`
+        );
+      }
+      throw e;
+    }
 
     console.warn(
       `[ai-providers] ${primary} failed (${kind}); falling back to ${fallback}`

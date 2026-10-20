@@ -145,9 +145,19 @@ old Railway deployment is gone, and the review endpoint now lives in the app:
   route stores `provider:model` in `Review.modelUsed` so a fallback review is
   never mistaken for the primary's output.
 
-Fallback is **opt-in** (`AI_REVIEW_FALLBACK`) and **capacity-only** — 429,
-overloaded, or an exhausted output budget. It never fires for a bad key or a
-malformed answer, because those are bugs a second provider would hide.
+Fallback is **single-hop** and **infrastructure-only** — HTTP 429, an overloaded
+upstream, a timeout, a non-JSON HTTP body (a WAF/HTML interstitial or an empty
+2xx), or an exhausted output budget. When `AI_REVIEW_FALLBACK` is unset and a
+Groq key exists, Groq is used automatically so a gateway outage costs review
+quality instead of the whole review; `AI_REVIEW_FALLBACK=none` requires a single
+provider. It never fires for a bad key or for a model whose *own* answer is not
+JSON, because those are bugs a second provider would hide.
+
+A 2xx with a non-JSON body is deliberately **not** treated as a malformed
+answer: it means something in front of the model failed (AgentRouter sits behind
+a WAF that can serve an HTML challenge to datacenter IPs). The provider logs
+`status`, `content-type`, byte count and a 200-char sanitized preview of that
+body — that log line is how you tell a WAF block from a truncated response.
 
 Failures consume no quota: the route releases the reserved daily slot on every
 error path. A missing key, HTTP error or malformed answer surfaces as a

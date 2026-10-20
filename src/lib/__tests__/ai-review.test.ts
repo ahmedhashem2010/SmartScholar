@@ -670,6 +670,87 @@ describe("reviewDocument — AgentRouter", () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* Gateway-level failures are upstream, not malformed answers.         */
+/*                                                                     */
+/* A 2xx whose body is HTML (WAF interstitial) or empty is the gateway */
+/* failing before the model runs — retrying on another provider is the */
+/* right response. Model prose that is not JSON stays malformed.       */
+/* ------------------------------------------------------------------ */
+
+describe("reviewDocument — non-JSON HTTP bodies are upstream failures", () => {
+  it("treats a 2xx HTML body as upstream and falls back to Groq by default", async () => {
+    useAgentRouter();
+    process.env.GROQ_API_KEY = "test-groq-key";
+    const calls = mockFetch([
+      {
+        url: AGENTROUTER_URL,
+        status: 200,
+        contentType: "text/html; charset=utf-8",
+        body: "<!DOCTYPE html><html><head><title>Just a moment...</title></head><body>challenge</body></html>",
+      },
+      groqResponse(validReview),
+    ]);
+
+    const { reviewDocumentWithMeta } = await import("@/lib/ai-review");
+    const result = await reviewDocumentWithMeta("Some CV text", "CV");
+
+    expect(result.provider).toBe("groq");
+    expect(result.review).toEqual(validReview);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("treats an empty 2xx body as upstream", async () => {
+    useAgentRouter();
+    process.env.GROQ_API_KEY = "test-groq-key";
+    const calls = mockFetch([
+      { url: AGENTROUTER_URL, status: 200, body: "" },
+      groqResponse(validReview),
+    ]);
+
+    await expect(reviewDocument("Some CV text", "CV")).resolves.toEqual(validReview);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("honours AI_REVIEW_FALLBACK=none even when a Groq key is present", async () => {
+    useAgentRouter();
+    process.env.GROQ_API_KEY = "test-groq-key";
+    process.env.AI_REVIEW_FALLBACK = "none";
+    const calls = mockFetch([
+      { url: AGENTROUTER_URL, status: 200, contentType: "text/html", body: "<html>blocked</html>" },
+    ]);
+
+    await expect(reviewDocument("Some CV text", "CV")).rejects.toThrow(/non-JSON response/);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("still does not fall back when the model's own text is not JSON", async () => {
+    useAgentRouter();
+    process.env.GROQ_API_KEY = "test-groq-key";
+    const calls = mockFetch([
+      {
+        url: AGENTROUTER_URL,
+        body: JSON.stringify({ choices: [{ message: { content: "I cannot review this." } }] }),
+      },
+    ]);
+
+    await expect(reviewDocument("Some CV text", "CV")).rejects.toThrow(/not valid JSON/);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("names the missing fallback key instead of hiding it", async () => {
+    useAgentRouter();
+    process.env.AI_REVIEW_FALLBACK = "groq";
+    mockFetch([
+      { url: AGENTROUTER_URL, status: 200, contentType: "text/html", body: "<html>blocked</html>" },
+    ]);
+
+    await expect(reviewDocument("Some CV text", "CV")).rejects.toThrow(
+      /fallback provider but its API key is missing/
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /* A stale AI_REVIEW_SERVICE_URL must not brick reviews.               */
 /*                                                                     */
 /* A deleted Railway app answers 404 {"message":"Application not       */
