@@ -217,14 +217,20 @@ ${text}`;
  * way to tell a Cloudflare interstitial from a truncated response, and it never
  * contains a key.
  */
-function describeNonJson(provider: string, res: Response, body: string): string {
+function describeNonJson(provider: string, res: Response, body: string, endpoint?: string): string {
   const contentType = res.headers.get("content-type") || "no content-type";
   const preview = body.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
   console.error(
     `[ai-providers] ${provider} non-JSON body: status=${res.status} contentType=${contentType} ` +
-      `bytes=${body.length} preview=${JSON.stringify(preview)}`
+      `bytes=${body.length} endpoint=${endpoint || "unknown"} preview=${JSON.stringify(preview)}`
   );
-  return `${provider} returned a non-JSON response (HTTP ${res.status}, ${contentType}, ${body.length} bytes).`;
+  // Naming the endpoint matters: the same WAF page comes back from the gateway
+  // whether the call left from Vercel or from the relay, and this is the only
+  // thing in the error that says which route was actually used.
+  return (
+    `${provider} returned a non-JSON response (HTTP ${res.status}, ${contentType}, ${body.length} bytes)` +
+    (endpoint ? ` from ${endpoint}.` : ".")
+  );
 }
 
 /** Strip ```json fences and any leading prose a model may add defensively. */
@@ -569,7 +575,7 @@ async function callAgentRouter(prompt: string, model: string): Promise<unknown> 
   try {
     payload = JSON.parse(body);
   } catch {
-    throw new ProviderError("upstream", "agentrouter", describeNonJson("AgentRouter", res, body));
+    throw new ProviderError("upstream", "agentrouter", describeNonJson("AgentRouter", res, body, base));
   }
 
   const choice = payload.choices?.[0];

@@ -730,6 +730,24 @@ describe("reviewDocument — AgentRouter", () => {
     await reviewDocument("Some CV text", "CV");
     expect(calls).toHaveLength(1);
   });
+
+  it("names the relay endpoint when the gateway's answer is not JSON", async () => {
+    useRelay();
+    mockFetch([
+      {
+        url: RELAY_URL,
+        status: 200,
+        contentType: "text/html; charset=utf-8",
+        body: "<html>challenge</html>",
+      },
+    ]);
+
+    const err = await reviewDocument("Some CV text", "CV").catch((e: unknown) => e);
+    // The message must say which route was used: the same WAF page can come
+    // back through the relay, and without the endpoint the two are identical.
+    expect((err as Error).message).toContain("https://agentrouter-relay.up.railway.app");
+    expect((err as Error).message).toContain("non-JSON response");
+  });
 });
 
 /* ------------------------------------------------------------------ */
