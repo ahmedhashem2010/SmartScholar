@@ -136,6 +136,11 @@ old Railway deployment is gone, and the review endpoint now lives in the app:
   `ReviewScore`, `validateReviewScore`, and the `Ai*Error` classes the route
   already maps. If `AI_REVIEW_SERVICE_URL` is set it POSTs there instead
   (a future isolated deployment), but the default is a direct provider call.
+  **A 404 from that URL means the deployment was deleted** (a deleted Railway
+  app answers `Application not found`), so reviews transparently fall back to
+  the in-process provider with an error log instead of failing every request.
+  Any other status — 401/403/429/500 — still surfaces, because silently
+  switching would hide a real outage.
 - `reviewDocumentWithMeta()` returns the provider/model that actually ran; the
   route stores `provider:model` in `Review.modelUsed` so a fallback review is
   never mistaken for the primary's output.

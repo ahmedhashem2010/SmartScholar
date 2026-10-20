@@ -71,6 +71,19 @@ export class AiWafBlockError extends Error {
 }
 
 /**
+ * The configured review service answered 404, which means the deployment
+ * itself is gone — a deleted Railway app answers `{"message":"Application
+ * not found"}`. Internal only: it never reaches the client, because the caller
+ * falls back to the in-process provider (which is fully functional).
+ */
+class RemoteServiceMissingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RemoteServiceMissingError";
+  }
+}
+
+/**
  * Verdict on whether a document appears to need a signature and whether the
  * text shows evidence of one. Produced by the review service and normalized
  * there; SmartScholar treats it as optional because deployed versions that
@@ -189,6 +202,7 @@ function reviewServiceTimeoutMs(): number {
  * Parse the review-service error body ({ error, message }) and classify it
  * into the error contract SmartScholar's route already understands:
  *   - 401/403            -> AiConfigError   (service not configured / auth)
+ *   - 404                -> RemoteServiceMissingError (deployment deleted)
  *   - 429                -> AiCapacityError (rate limit)
  *   - UPSTREAM_WAF_BLOCK -> AiWafBlockError (gateway WAF block, not retryable)
  *   - everything else    -> plain Error with the client-safe service message
@@ -206,6 +220,9 @@ function mapReviewServiceError(status: number, body: string): Error {
 
   if (status === 401 || status === 403) {
     return new AiConfigError(message);
+  }
+  if (status === 404) {
+    return new RemoteServiceMissingError(message);
   }
   if (status === 429) {
     return new AiCapacityError(message);
@@ -339,10 +356,30 @@ async function callReviewService(
   text: string,
   documentType: string
 ): Promise<{ review: ReviewScore; provider: string; model: string }> {
-  if (getReviewServiceUrl()) {
-    return callRemoteService(text, documentType);
+  const url = getReviewServiceUrl();
+  if (!url) return callProviderInProcess(text, documentType);
+
+  try {
+    return await callRemoteService(text, documentType);
+  } catch (e) {
+    if (!(e instanceof RemoteServiceMissingError)) throw e;
+
+    // A 404 means the deployment is gone, not that it is briefly unavailable —
+    // a deleted Railway app answers "Application not found". The in-process
+    // provider is fully functional, so use it rather than failing a review over
+    // an environment variable someone forgot to delete.
+    let host = "the configured URL";
+    try {
+      host = new URL(url).host;
+    } catch {
+      /* keep the placeholder */
+    }
+    console.error(
+      `[ai-review] AI_REVIEW_SERVICE_URL (${host}) returned 404 — that service no longer exists. ` +
+        `Falling back to the in-process provider. Remove AI_REVIEW_SERVICE_URL in Vercel to silence this.`
+    );
+    return callProviderInProcess(text, documentType);
   }
-  return callProviderInProcess(text, documentType);
 }
 
 /**

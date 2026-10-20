@@ -668,3 +668,59 @@ describe("reviewDocument — AgentRouter", () => {
     expect(calls).toHaveLength(2);
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* A stale AI_REVIEW_SERVICE_URL must not brick reviews.               */
+/*                                                                     */
+/* A deleted Railway app answers 404 {"message":"Application not       */
+/* found"}. That used to surface as a 502 for every review even though  */
+/* the in-process provider was configured and healthy.                 */
+/* ------------------------------------------------------------------ */
+
+describe("reviewDocument — configured review service no longer exists", () => {
+  it("falls back to the in-process provider on 404 and reports its name", async () => {
+    useGroq();
+    process.env.AI_REVIEW_SERVICE_URL = "https://my-review-service.up.railway.app";
+    const calls = mockFetch([
+      {
+        url: REVIEW_URL,
+        status: 404,
+        body: JSON.stringify({ status: "error", code: 404, message: "Application not found" }),
+      },
+      groqResponse(validReview),
+    ]);
+
+    const { reviewDocumentWithMeta } = await import("@/lib/ai-review");
+    const result = await reviewDocumentWithMeta("Some CV text", "CV");
+
+    expect(result.review).toEqual(validReview);
+    expect(result.provider).toBe("groq");
+    expect(result.model).toBe("openai/gpt-oss-120b");
+    expect(calls).toHaveLength(2);
+    expect(calls[0]!.url).toBe(REVIEW_URL);
+    expect(calls[1]!.url).toBe(GROQ_URL);
+  });
+
+  it("falls back on a 404 with a non-JSON body too", async () => {
+    useGroq();
+    process.env.AI_REVIEW_SERVICE_URL = "https://my-review-service.up.railway.app";
+    const calls = mockFetch([
+      { url: REVIEW_URL, status: 404, contentType: "text/plain", body: "Application not found" },
+      groqResponse(validReview),
+    ]);
+
+    await expect(reviewDocument("Some CV text", "CV")).resolves.toEqual(validReview);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("still surfaces a 500 from a live service instead of silently switching", async () => {
+    useGroq();
+    process.env.AI_REVIEW_SERVICE_URL = "https://my-review-service.up.railway.app";
+    const calls = mockFetch([
+      { url: REVIEW_URL, status: 500, body: JSON.stringify({ error: "UPSTREAM_ERROR", message: "boom" }) },
+    ]);
+
+    await expect(reviewDocument("Some CV text", "CV")).rejects.toThrow(/boom/);
+    expect(calls).toHaveLength(1);
+  });
+});
